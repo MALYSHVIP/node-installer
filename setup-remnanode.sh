@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+on_error() {
+  local line="${1:-?}"
+  local command="${2:-unknown}"
+  printf '\n[ERROR] line=%s command=%s\n' "$line" "$command" >&2
+}
+
+trap 'on_error "${LINENO}" "${BASH_COMMAND}"' ERR
+
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Запусти скрипт от root."
   exit 1
@@ -77,8 +85,10 @@ STRICT_EGRESS_GUARD="${STRICT_EGRESS_GUARD:-1}"
 ENSURE_CAKE_STACK="${ENSURE_CAKE_STACK:-0}"
 APT_LOCK_TIMEOUT="${APT_LOCK_TIMEOUT:-900}"
 XHTTP_DOMAIN="${XHTTP_DOMAIN:-}"
+XHTTP_ENABLE="${XHTTP_ENABLE:-ask}"
 XHTTP_PATH="${XHTTP_PATH:-/xhttp-universal/}"
 XHTTP_ENABLE_H3="${XHTTP_ENABLE_H3:-auto}"
+NGINX_REPO_CODENAME="${NGINX_REPO_CODENAME:-}"
 CERTBOT_RETRY_TRIES="${CERTBOT_RETRY_TRIES:-6}"
 CERTBOT_RETRY_BASE_DELAY="${CERTBOT_RETRY_BASE_DELAY:-10}"
 CERTBOT_RETRY_MAX_DELAY="${CERTBOT_RETRY_MAX_DELAY:-60}"
@@ -177,10 +187,30 @@ read_optional_xhttp_domain() {
     return 0
   fi
 
-  printf "\nНужен xHTTP для этой ноды?\n"
+  case "$(printf '%s' "$XHTTP_ENABLE" | tr '[:upper:]' '[:lower:]')" in
+    0|n|no|false|off)
+      log "xHTTP отключён через XHTTP_ENABLE=$XHTTP_ENABLE"
+      return 0
+      ;;
+    1|y|yes|true|on)
+      enable_xhttp="y"
+      ;;
+    ask|"")
+      ;;
+    *)
+      die "XHTTP_ENABLE должен быть ask/yes/no или boolean-значением"
+      ;;
+  esac
+
+  if [[ -z "$enable_xhttp" ]]; then
+    printf "\nНужен xHTTP для этой ноды?\n"
+  fi
+
   while true; do
-    enable_xhttp="$(ask "Enable xHTTP? (y/n): ")"
-    enable_xhttp="$(printf '%s' "$enable_xhttp" | tr '[:upper:]' '[:lower:]' | tr -d '\r')"
+    if [[ -z "$enable_xhttp" ]]; then
+      enable_xhttp="$(ask "Enable xHTTP? (y/n): ")"
+      enable_xhttp="$(printf '%s' "$enable_xhttp" | tr '[:upper:]' '[:lower:]' | tr -d '\r')"
+    fi
 
     case "$enable_xhttp" in
       y|yes)
@@ -213,6 +243,54 @@ append_line_once() {
   local file="$1"
   local line="$2"
   grep -qxF "$line" "$file" 2>/dev/null || printf "%s\n" "$line" >> "$file"
+}
+
+read_env_file_value() {
+  local file="$1"
+  local key="$2"
+
+  [[ -f "$file" ]] || return 1
+
+  sed -nE "s/^${key}=(.*)\$/\\1/p" "$file" | head -n1
+}
+
+load_existing_install_state() {
+  local existing_secret=""
+  local existing_node_ip=""
+  local existing_panel_ip=""
+
+  if [[ -f "$ENV_FILE" ]]; then
+    if [[ -z "${SECRET_KEY:-}" && -z "$SECRET_VALUE" ]]; then
+      existing_secret="$(read_env_file_value "$ENV_FILE" "SECRET_KEY" || true)"
+      if [[ -n "$existing_secret" ]]; then
+        SECRET_VALUE="$existing_secret"
+        log "Нашёл существующий SECRET_KEY в $ENV_FILE, повторный запуск будет без лишнего вопроса"
+      fi
+    fi
+
+    if [[ -z "$NODE_IP" ]]; then
+      existing_node_ip="$(read_env_file_value "$ENV_FILE" "NODE_IP" || true)"
+      if [[ -n "$existing_node_ip" ]]; then
+        NODE_IP="$existing_node_ip"
+      fi
+    fi
+  fi
+
+  if [[ -z "$PANEL_IP" && -f "$PANEL_IPS_FILE" ]]; then
+    existing_panel_ip="$(sed -n '1p' "$PANEL_IPS_FILE" 2>/dev/null || true)"
+    if is_ipv4 "$existing_panel_ip"; then
+      PANEL_IP="$existing_panel_ip"
+      log "Нашёл существующий PANEL_IP в $PANEL_IPS_FILE"
+    fi
+  fi
+
+  if [[ -z "$PANEL_IP" && -f "$FIREWALL_SCRIPT" ]]; then
+    existing_panel_ip="$(sed -nE 's/^PANEL_IP="([0-9.]+)"/\1/p' "$FIREWALL_SCRIPT" | head -n1)"
+    if is_ipv4 "$existing_panel_ip"; then
+      PANEL_IP="$existing_panel_ip"
+      log "Нашёл существующий PANEL_IP в $FIREWALL_SCRIPT"
+    fi
+  fi
 }
 
 run_retry() {
@@ -471,10 +549,7 @@ prepare_apt_environment() {
     apt-daily-upgrade.timer \
     apt-daily.service \
     apt-daily-upgrade.service \
-    unattended-upgrades.service \
-    packagekit.service \
-    packagekit-offline-update.service \
-    packagekit-offline-update.timer
+    unattended-upgrades.service
   do
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
   done
@@ -482,11 +557,17 @@ prepare_apt_environment() {
   for unit in \
     apt-daily.service \
     apt-daily-upgrade.service \
-    unattended-upgrades.service \
-    packagekit.service \
-    packagekit-offline-update.service
+    unattended-upgrades.service
   do
     systemctl mask "$unit" >/dev/null 2>&1 || true
+  done
+
+  for unit in \
+    packagekit.service \
+    packagekit-offline-update.service \
+    packagekit-offline-update.timer
+  do
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
   done
 
   wait_for_apt_locks
@@ -1064,9 +1145,6 @@ disable_noisy_services() {
     apt-daily.service \
     apt-daily-upgrade.service \
     unattended-upgrades.service \
-    packagekit.service \
-    packagekit-offline-update.service \
-    packagekit-offline-update.timer \
     snapd.service \
     snapd.socket \
     snapd.seeded.service \
@@ -1081,8 +1159,6 @@ disable_noisy_services() {
     apt-daily.service \
     apt-daily-upgrade.service \
     unattended-upgrades.service \
-    packagekit.service \
-    packagekit-offline-update.service \
     snapd.service \
     snapd.socket \
     ModemManager.service \
@@ -1090,6 +1166,10 @@ disable_noisy_services() {
     udisks2.service
   do
     systemctl mask "$unit" >/dev/null 2>&1 || true
+  done
+
+  for unit in packagekit.service packagekit-offline-update.service packagekit-offline-update.timer; do
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
   done
 }
 
@@ -1184,16 +1264,27 @@ normalize_xhttp_path() {
 }
 
 install_nginx_mainline_repo() {
+  local repo_codename=""
+
   install -d -m 0755 /etc/apt/keyrings
+
+  if [[ -n "$NGINX_REPO_CODENAME" ]]; then
+    repo_codename="$NGINX_REPO_CODENAME"
+  else
+    repo_codename="$(
+      . /etc/os-release 2>/dev/null || true
+      printf '%s' "${VERSION_CODENAME:-jammy}"
+    )"
+  fi
 
   if [[ ! -f /etc/apt/keyrings/nginx.gpg ]]; then
     curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /etc/apt/keyrings/nginx.gpg
     chmod 0644 /etc/apt/keyrings/nginx.gpg
   fi
 
-  cat > /etc/apt/sources.list.d/nginx-mainline.list <<'EOF'
-deb [signed-by=/etc/apt/keyrings/nginx.gpg] http://nginx.org/packages/mainline/ubuntu jammy nginx
-deb-src [signed-by=/etc/apt/keyrings/nginx.gpg] http://nginx.org/packages/mainline/ubuntu jammy nginx
+  cat > /etc/apt/sources.list.d/nginx-mainline.list <<EOF
+deb [signed-by=/etc/apt/keyrings/nginx.gpg] http://nginx.org/packages/mainline/ubuntu ${repo_codename} nginx
+deb-src [signed-by=/etc/apt/keyrings/nginx.gpg] http://nginx.org/packages/mainline/ubuntu ${repo_codename} nginx
 EOF
 }
 
@@ -1742,6 +1833,23 @@ parse_secret() {
 
 read_manual_secret() {
   local secret_raw=""
+
+  if [[ -n "$SECRET_VALUE" ]]; then
+    log "Секрет ноды взят из существующего состояния"
+    printf "NODE_PORT=%s\n" "$NODE_PORT"
+    printf "SECRET_KEY=<hidden>, длина=%s\n" "${#SECRET_VALUE}"
+    return 0
+  fi
+
+  if [[ -n "${SECRET_KEY:-}" ]]; then
+    SECRET_VALUE="$(parse_secret "$SECRET_KEY")"
+    [[ -n "$SECRET_VALUE" ]] || die "Не удалось распознать SECRET_KEY из окружения"
+
+    log "Секрет ноды принят из окружения"
+    printf "NODE_PORT=%s\n" "$NODE_PORT"
+    printf "SECRET_KEY=<hidden>, длина=%s\n" "${#SECRET_VALUE}"
+    return 0
+  fi
 
   printf "\nВведи секрет ноды.\n"
   printf "Можно вставить любой из вариантов:\n"
@@ -2576,7 +2684,7 @@ if child_process_import not in text:
         raise SystemExit("failed to locate xtls-sdk import in stats.service override")
     text = text.replace(import_marker, import_marker + child_process_import, 1)
 
-stats_pattern = re.compile(r"getUsersStats\(reset\) \{.*?^\s+async getInboundStats\(tag, reset\) \{", re.S | re.M)
+stats_pattern = re.compile(r"async getUsersStats\(reset\) \{.*?^\s+async getInboundStats\(tag, reset\) \{", re.S | re.M)
 stats_replacement = """getLocalIpv4s() {
         try {
             const output = (0, child_process_1.execFileSync)('/sbin/ip', ['-o', '-4', 'addr', 'show', 'scope', 'global'], { encoding: 'utf8' });
@@ -2760,7 +2868,7 @@ stats_replacement = """getLocalIpv4s() {
         }
     }
     async getInboundStats(tag, reset) {"""
-text, count = stats_pattern.subn(stats_replacement, text, count=1)
+text, count = stats_pattern.subn(lambda _m: stats_replacement, text, count=1)
 if count != 1:
     raise SystemExit("failed to patch getUsersStats in stats.service override")
 
@@ -2876,7 +2984,7 @@ ip_list_replacement = """async getUsersIpList() {
         }
     }
     extractOnlineUserId(raw) {"""
-text, count = ip_list_pattern.subn(ip_list_replacement, text, count=1)
+text, count = ip_list_pattern.subn(lambda _m: ip_list_replacement, text, count=1)
 if count != 1:
     raise SystemExit("failed to patch getUsersIpList in stats.service override")
 
@@ -3255,6 +3363,29 @@ WantedBy=timers.target
 EOF
 }
 
+validate_rendered_artifacts() {
+  log "Проверяю сгенерированные артефакты перед запуском"
+
+  [[ -s "$ENV_FILE" ]] || die "Файл окружения не создан: $ENV_FILE"
+  [[ -s "$COMPOSE_FILE" ]] || die "Compose-файл не создан: $COMPOSE_FILE"
+  [[ -s "$COMPOSE_OVERRIDE_FILE" ]] || die "Compose override не создан: $COMPOSE_OVERRIDE_FILE"
+  [[ -s "$GENERATE_API_OVERRIDE" ]] || die "Override generate-api-config.js не создан"
+  [[ -s "$STATS_SERVICE_OVERRIDE" ]] || die "Override stats.service.js не создан"
+  [[ -s "$WATCHDOG_SCRIPT" ]] || die "Watchdog script не создан"
+  [[ -s "$FIREWALL_SCRIPT" ]] || die "Firewall script не создан"
+
+  bash -n "$WATCHDOG_SCRIPT" || die "Watchdog script содержит синтаксическую ошибку"
+  bash -n "$FIREWALL_SCRIPT" || die "Firewall script содержит синтаксическую ошибку"
+  if [[ -f "$MSS_CLAMP_SCRIPT" ]]; then
+    bash -n "$MSS_CLAMP_SCRIPT" || die "MSS clamp script содержит синтаксическую ошибку"
+  fi
+  if [[ -f "$XHTTP_SYNC_SCRIPT" ]]; then
+    bash -n "$XHTTP_SYNC_SCRIPT" || die "xHTTP sync script содержит синтаксическую ошибку"
+  fi
+
+  compose config >/dev/null || die "docker compose config завершился ошибкой"
+}
+
 pull_and_start_node() {
   local i=""
   local stale_ids=""
@@ -3279,7 +3410,7 @@ pull_and_start_node() {
   fi
 
   log "Запускаю ноду"
-  compose up -d --force-recreate remnanode
+  compose up -d --force-recreate --remove-orphans remnanode
 }
 
 write_trusted_panel_ip() {
@@ -3550,6 +3681,9 @@ show_result() {
   printf "Adaptive Xray profile: %s\n" "$(resolved_xray_sniff_profile)"
   printf "Xray loglevel/access: %s / %s\n" "$(resolved_xray_loglevel)" "$(resolved_xray_access_log)"
   printf "Nightly cleanup: %s\n" "$NIGHTLY_CLEANUP_SCHEDULE"
+  if xhttp_requested; then
+    printf "xHTTP: %s%s\n" "$XHTTP_DOMAIN" "$XHTTP_PATH"
+  fi
 
   printf "\nКонтейнер:\n"
   compose ps || true
@@ -3608,6 +3742,7 @@ show_result() {
 main() {
   local iface=""
 
+  load_existing_install_state
   autodetect_node_ip
   read_panel_ip
   read_optional_xhttp_domain
@@ -3645,6 +3780,7 @@ main() {
   write_trusted_panel_ip
   write_firewall
   write_mss_clamp
+  validate_rendered_artifacts
   pull_and_start_node
   configure_xhttp_stack
   enable_boot_services
