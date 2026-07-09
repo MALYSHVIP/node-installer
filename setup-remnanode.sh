@@ -85,9 +85,9 @@ STRICT_EGRESS_GUARD="${STRICT_EGRESS_GUARD:-1}"
 ENSURE_CAKE_STACK="${ENSURE_CAKE_STACK:-0}"
 APT_LOCK_TIMEOUT="${APT_LOCK_TIMEOUT:-900}"
 XHTTP_DOMAIN="${XHTTP_DOMAIN:-}"
-XHTTP_ENABLE="${XHTTP_ENABLE:-ask}"
-XHTTP_PATH="${XHTTP_PATH:-/xhttp-universal/}"
-XHTTP_ENABLE_H3="${XHTTP_ENABLE_H3:-auto}"
+XHTTP_ENABLE="${XHTTP_ENABLE:-yes}"
+XHTTP_PATH="${XHTTP_PATH:-/stable-in-443/}"
+XHTTP_ENABLE_H3="${XHTTP_ENABLE_H3:-off}"
 NGINX_REPO_CODENAME="${NGINX_REPO_CODENAME:-}"
 CERTBOT_RETRY_TRIES="${CERTBOT_RETRY_TRIES:-6}"
 CERTBOT_RETRY_BASE_DELAY="${CERTBOT_RETRY_BASE_DELAY:-10}"
@@ -1295,7 +1295,7 @@ wait_for_xhttp_socket() {
   local h2_socket=""
 
   for ((attempt = 1; attempt <= tries; attempt++)); do
-    h2_socket="$(find /dev/shm -maxdepth 1 -type s -name 'xrxh*.socket' ! -name '*h3*' | sort | head -n1 || true)"
+    h2_socket="$(find /dev/shm -maxdepth 1 -type s -name 'xrxh-stable.socket' | sort | head -n1 || true)"
     if [[ -n "$h2_socket" ]]; then
       printf '%s' "$h2_socket"
       return 0
@@ -1368,7 +1368,7 @@ render_changed() {
   return 0
 }
 
-h2_socket="\$(find /dev/shm -maxdepth 1 -type s -name 'xrxh*.socket' ! -name '*h3*' | sort | head -n1 || true)"
+h2_socket="\$(find /dev/shm -maxdepth 1 -type s -name 'xrxh-stable.socket' | sort | head -n1 || true)"
 h3_socket="\$(find_socket 'xrxh*h3*.socket')"
 changed=0
 
@@ -1413,10 +1413,12 @@ server {
     access_log off;
 
     location $XHTTP_PATH {
-        client_max_body_size 0;
+        client_max_body_size 100M;
         client_body_timeout 10m;
+        client_body_buffer_size 512k;
+        chunked_transfer_encoding on;
         grpc_read_timeout 1h;
-        grpc_send_timeout 10m;
+        grpc_send_timeout 1h;
         grpc_socket_keepalive on;
         grpc_buffer_size 64k;
         grpc_set_header Host \\\$host;
@@ -1469,10 +1471,12 @@ server {
     access_log off;
 
     location $XHTTP_PATH {
-        client_max_body_size 0;
+        client_max_body_size 100M;
         client_body_timeout 10m;
+        client_body_buffer_size 512k;
+        chunked_transfer_encoding on;
         grpc_read_timeout 1h;
-        grpc_send_timeout 10m;
+        grpc_send_timeout 1h;
         grpc_socket_keepalive on;
         grpc_buffer_size 64k;
         grpc_set_header Host \\\$host;
@@ -1568,7 +1572,7 @@ configure_xhttp_stack() {
   fi
 
   normalize_xhttp_path
-  log "Включаю optional xHTTP-слой для домена $XHTTP_DOMAIN"
+  log "Включаю STABLE-IN-443 xHTTP/H2 слой для домена $XHTTP_DOMAIN"
   nginx_worker_processes="$(recommended_nginx_worker_processes)"
   nginx_worker_connections="$(recommended_nginx_worker_connections)"
   nginx_rlimit_nofile="$(recommended_nginx_rlimit_nofile)"
@@ -1713,10 +1717,12 @@ server {
     access_log off;
 
     location $XHTTP_PATH {
-        client_max_body_size 0;
+        client_max_body_size 100M;
         client_body_timeout 10m;
+        client_body_buffer_size 512k;
+        chunked_transfer_encoding on;
         grpc_read_timeout 1h;
-        grpc_send_timeout 10m;
+        grpc_send_timeout 1h;
         grpc_socket_keepalive on;
         grpc_buffer_size 64k;
         grpc_set_header Host \$host;
@@ -1765,10 +1771,12 @@ server {
     access_log off;
 
     location $XHTTP_PATH {
-        client_max_body_size 0;
+        client_max_body_size 100M;
         client_body_timeout 10m;
+        client_body_buffer_size 512k;
+        chunked_transfer_encoding on;
         grpc_read_timeout 1h;
-        grpc_send_timeout 10m;
+        grpc_send_timeout 1h;
         grpc_socket_keepalive on;
         grpc_buffer_size 64k;
         grpc_set_header Host \$host;
@@ -1802,9 +1810,9 @@ EOF
   fi
   if ! verify_local_xhttp_h2; then
     journalctl -u remnanode-xhttp-sync.service -n 40 --no-pager || true
-    die "Локальный xHTTP H2 self-test не прошёл: https://$XHTTP_DOMAIN$XHTTP_PATH не отдаёт ожидаемый HTTP 400"
+    die "Локальный STABLE-IN-443 H2 self-test не прошёл: https://$XHTTP_DOMAIN$XHTTP_PATH не отдаёт ожидаемый HTTP 400"
   fi
-  log "Локальный xHTTP H2 self-test пройден"
+  log "Локальный STABLE-IN-443 H2 self-test пройден"
 }
 
 parse_secret() {
@@ -2435,6 +2443,103 @@ const SOCKET_SUFFIXES = [".socket", ".sock"];
 const ADAPTIVE_SNIFF_PROTOCOLS = __ADAPTIVE_SNIFF_PROTOCOLS__;
 const ADAPTIVE_ROUTE_ONLY = __ADAPTIVE_ROUTE_ONLY__;
 
+const TOKER_STABLE_XHTTP = {
+    tag: "STABLE-IN-443",
+    sourceTag: "BBR-IN-443",
+    listen: "/dev/shm/xrxh-stable.socket,0666",
+    path: "/stable-in-443/",
+    extra: {
+        noSSEHeader: true,
+        xPaddingBytes: "64-256",
+        scMaxBufferedPosts: 16,
+        scMaxEachPostBytes: 1000000,
+        scStreamUpServerSecs: "30-120",
+        xmux: {
+            maxConnections: "4-8",
+            cMaxReuseTimes: "64-128",
+            hMaxRequestTimes: "300-600",
+            hMaxReusableSecs: "600-1200",
+            hKeepAlivePeriod: 0,
+        },
+    },
+};
+
+const cloneStableClients = (sourceInbound) => {
+    const clients = Array.isArray(sourceInbound?.settings?.clients) ? sourceInbound.settings.clients : [];
+    return clients
+        .filter((client) => client && client.id)
+        .map((client) => {
+        const mirroredClient = { id: client.id, email: client.email };
+        if (client.flow) {
+            mirroredClient.flow = client.flow;
+        }
+        if (typeof client.level === "number") {
+            mirroredClient.level = client.level;
+        }
+        return mirroredClient;
+    });
+};
+
+const applyStableXhttpSettings = (inbound, sourceInbound) => {
+    const currentClients = Array.isArray(inbound?.settings?.clients) ? inbound.settings.clients : [];
+    inbound.tag = TOKER_STABLE_XHTTP.tag;
+    inbound.listen = TOKER_STABLE_XHTTP.listen;
+    inbound.protocol = "vless";
+    inbound.settings = {
+        ...(inbound.settings || {}),
+        decryption: "none",
+        clients: currentClients.length > 0 ? currentClients : cloneStableClients(sourceInbound),
+    };
+    inbound.streamSettings = {
+        ...(inbound.streamSettings || {}),
+        network: "xhttp",
+        xhttpSettings: {
+            mode: "auto",
+            path: TOKER_STABLE_XHTTP.path,
+            extra: TOKER_STABLE_XHTTP.extra,
+        },
+    };
+    inbound.sniffing = {
+        enabled: true,
+        routeOnly: true,
+        destOverride: ["http", "tls", "quic"],
+        metadataOnly: false,
+    };
+};
+
+const buildStableXhttpInboundFromSource = (sourceInbound) => {
+    const inbound = {
+        tag: TOKER_STABLE_XHTTP.tag,
+        listen: TOKER_STABLE_XHTTP.listen,
+        protocol: "vless",
+        settings: { decryption: "none", clients: cloneStableClients(sourceInbound) },
+        streamSettings: {},
+    };
+    applyStableXhttpSettings(inbound, sourceInbound);
+    return inbound;
+};
+
+const forceStableXhttpOnly = (userInbounds) => {
+    for (let index = userInbounds.length - 1; index >= 0; index -= 1) {
+        if (userInbounds[index]?.tag === "FAST-IN-443") {
+            userInbounds.splice(index, 1);
+        }
+    }
+    const sourceInbound = userInbounds.find((inbound) => inbound?.tag === TOKER_STABLE_XHTTP.sourceTag);
+    const stableInbound = userInbounds.find((inbound) => inbound?.tag === TOKER_STABLE_XHTTP.tag);
+    if (stableInbound) {
+        applyStableXhttpSettings(stableInbound, sourceInbound);
+        return;
+    }
+    if (!sourceInbound) {
+        console.warn(`[RemnaPatch] Stable xHTTP source inbound ${TOKER_STABLE_XHTTP.sourceTag} was not found`);
+        return;
+    }
+    const builtInbound = buildStableXhttpInboundFromSource(sourceInbound);
+    userInbounds.push(builtInbound);
+    console.warn(`[RemnaPatch] Injected stable xHTTP inbound ${builtInbound.tag} from ${TOKER_STABLE_XHTTP.sourceTag} with ${builtInbound.settings.clients.length} mirrored clients`);
+};
+
 const ensureInboundSniffing = (inbound) => {
     if (!inbound || inbound.tag === "REMNAWAVE_API_INBOUND" || inbound.protocol === "dokodemo-door") {
         return inbound;
@@ -2575,6 +2680,7 @@ const generateApiConfig = (args) => {
 
     const configInbounds = Array.isArray(config.inbounds) ? config.inbounds : [];
     const userInbounds = configInbounds.map(ensureInboundSniffing);
+    forceStableXhttpOnly(userInbounds);
     const existingRoutingRules = Array.isArray(config.routing?.rules) ? config.routing.rules : [];
     const hasBittorrentRule = existingRoutingRules.some((rule) => {
         if (!rule || !Array.isArray(rule.protocol)) {
@@ -3682,7 +3788,7 @@ show_result() {
   printf "Xray loglevel/access: %s / %s\n" "$(resolved_xray_loglevel)" "$(resolved_xray_access_log)"
   printf "Nightly cleanup: %s\n" "$NIGHTLY_CLEANUP_SCHEDULE"
   if xhttp_requested; then
-    printf "xHTTP: %s%s\n" "$XHTTP_DOMAIN" "$XHTTP_PATH"
+    printf "STABLE-IN-443 xHTTP/H2: %s%s\n" "$XHTTP_DOMAIN" "$XHTTP_PATH"
   fi
 
   printf "\nКонтейнер:\n"
