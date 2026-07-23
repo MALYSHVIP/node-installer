@@ -6,6 +6,7 @@ INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_FILE="${INSTALLER_FILE:-setup-remnanode.sh}"
 TMP_FILE=""
+LOCAL_INSTALLER_USED=0
 
 log() {
   printf '[install] %s\n' "$*"
@@ -28,24 +29,43 @@ cleanup() {
   fi
 }
 
+run_installer_script() {
+  local installer="$1"
+  local rc=0
+  shift
+
+  # /dev/tty can exist yet be unopenable in cron, cloud-init or a detached
+  # shell. Probe the open itself and otherwise preserve inherited stdin.
+  if { exec 7</dev/tty; } 2>/dev/null; then
+    bash "$installer" "$@" <&7 7<&- || rc=$?
+    exec 7<&-
+  else
+    bash "$installer" "$@" || rc=$?
+  fi
+  return "$rc"
+}
+
 run_local_installer() {
+  local rc=0
   local script_dir=""
   local local_installer=""
+  local source_path="${BASH_SOURCE[0]:-}"
 
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # When invoked as `curl ... | bash`, Bash has no source filename. In that
+  # mode skip local discovery and download the pinned installer as intended.
+  [[ -n "$source_path" ]] || return 0
+
+  script_dir="$(cd "$(dirname "$source_path")" && pwd)"
   local_installer="${script_dir}/${INSTALLER_FILE}"
 
-  if [[ -f "$local_installer" && "${BASH_SOURCE[0]}" != "$local_installer" ]]; then
+  if [[ -f "$local_installer" && "$source_path" != "$local_installer" ]]; then
+    LOCAL_INSTALLER_USED=1
     log "source=local installer=${local_installer}"
-    if [[ -r /dev/tty ]]; then
-      bash "$local_installer" "$@" </dev/tty
-    else
-      bash "$local_installer" "$@"
-    fi
-    return 0
+    run_installer_script "$local_installer" "$@" || rc=$?
+    return "$rc"
   fi
 
-  return 1
+  return 0
 }
 
 download_installer() {
@@ -55,7 +75,9 @@ download_installer() {
   log "source=github repo=${INSTALLER_REPO} ref=${INSTALLER_REF} file=${INSTALLER_FILE}"
 
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$TMP_FILE"
+    curl --proto '=https' --tlsv1.2 -fsSL \
+      --connect-timeout 15 --retry 4 --retry-delay 2 \
+      "$url" -o "$TMP_FILE"
     return 0
   fi
 
@@ -68,21 +90,21 @@ download_installer() {
 }
 
 main() {
+  local local_rc=0
   need_root
   trap cleanup EXIT
 
-  if run_local_installer "$@"; then
-    exit 0
+  run_local_installer "$@" || local_rc=$?
+  if [[ "$LOCAL_INSTALLER_USED" == "1" ]]; then
+    exit "$local_rc"
   fi
 
   TMP_FILE="$(mktemp /tmp/node-installer.XXXXXX.sh)"
   download_installer
+  [[ -s "$TMP_FILE" ]] || die "downloaded installer is empty"
+  bash -n "$TMP_FILE" || die "downloaded installer has invalid shell syntax"
   chmod 700 "$TMP_FILE"
-  if [[ -r /dev/tty ]]; then
-    bash "$TMP_FILE" "$@" </dev/tty
-  else
-    bash "$TMP_FILE" "$@"
-  fi
+  run_installer_script "$TMP_FILE" "$@"
 }
 
 main "$@"
