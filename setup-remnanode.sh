@@ -37,6 +37,15 @@ XHTTP_GUARD_SCRIPT="/usr/local/sbin/remnanode-xhttp-socket-guard.sh"
 XHTTP_GUARD_SERVICE="/etc/systemd/system/remnanode-xhttp-socket-guard.service"
 XHTTP_GUARD_TIMER="/etc/systemd/system/remnanode-xhttp-socket-guard.timer"
 XHTTP_GUARD_MARKER="/run/remnanode-xhttp-guard.last-restart"
+SPAMHAUS_EGRESS_GUARD_SCRIPT="/usr/local/sbin/remnanode-spamhaus-egress-guard.sh"
+SPAMHAUS_EGRESS_GUARD_SERVICE="/etc/systemd/system/remnanode-spamhaus-egress-guard.service"
+SPAMHAUS_EGRESS_GUARD_TIMER="/etc/systemd/system/remnanode-spamhaus-egress-guard.timer"
+OUTBOUND_SSH_GUARD_SCRIPT="/usr/local/sbin/remnanode-outbound-ssh-guard.sh"
+OUTBOUND_SSH_GUARD_SERVICE="/etc/systemd/system/remnanode-outbound-ssh-guard.service"
+DNS_REFLECTION_GUARD_SCRIPT="/usr/local/sbin/remnanode-dns-reflection-guard.sh"
+DNS_REFLECTION_GUARD_SERVICE="/etc/systemd/system/remnanode-dns-reflection-guard.service"
+BITTORRENT_GUARD_SCRIPT="/usr/local/sbin/remnanode-bittorrent-guard.sh"
+BITTORRENT_GUARD_SERVICE="/etc/systemd/system/remnanode-bittorrent-guard.service"
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/60-remnanode-limits.conf"
 LEGACY_REBOOT_MARKER="$STATE_DIR/legacy-runtime-boot-id"
 
@@ -71,6 +80,10 @@ PUBLIC_UDP_PORTS_EXPLICIT="${PUBLIC_UDP_PORTS+x}"
 BLOCK_SMTP_EGRESS_EXPLICIT="${BLOCK_SMTP_EGRESS+x}"
 BLOCK_SMTP_FORWARD_EXPLICIT="${BLOCK_SMTP_FORWARD+x}"
 SMTP_EGRESS_PORTS_EXPLICIT="${SMTP_EGRESS_PORTS+x}"
+ENABLE_SPAMHAUS_EGRESS_GUARD_EXPLICIT="${ENABLE_SPAMHAUS_EGRESS_GUARD+x}"
+ENABLE_OUTBOUND_SSH_GUARD_EXPLICIT="${ENABLE_OUTBOUND_SSH_GUARD+x}"
+ENABLE_DNS_REFLECTION_GUARD_EXPLICIT="${ENABLE_DNS_REFLECTION_GUARD+x}"
+ENABLE_BITTORRENT_GUARD_EXPLICIT="${ENABLE_BITTORRENT_GUARD+x}"
 ENABLE_BBR_EXPLICIT="${ENABLE_BBR+x}"
 AUTO_SWAP_EXPLICIT="${AUTO_SWAP+x}"
 ENABLE_MAINTENANCE_EXPLICIT="${ENABLE_MAINTENANCE+x}"
@@ -99,8 +112,12 @@ MANAGE_FIREWALL="${MANAGE_FIREWALL:-1}"
 PUBLIC_TCP_PORTS="${PUBLIC_TCP_PORTS:-443}"
 PUBLIC_UDP_PORTS="${PUBLIC_UDP_PORTS:-443}"
 BLOCK_SMTP_EGRESS="${BLOCK_SMTP_EGRESS:-1}"
-BLOCK_SMTP_FORWARD="${BLOCK_SMTP_FORWARD:-0}"
+BLOCK_SMTP_FORWARD="${BLOCK_SMTP_FORWARD:-1}"
 SMTP_EGRESS_PORTS="${SMTP_EGRESS_PORTS:-25,465,587,2525}"
+ENABLE_SPAMHAUS_EGRESS_GUARD="${ENABLE_SPAMHAUS_EGRESS_GUARD:-1}"
+ENABLE_OUTBOUND_SSH_GUARD="${ENABLE_OUTBOUND_SSH_GUARD:-1}"
+ENABLE_DNS_REFLECTION_GUARD="${ENABLE_DNS_REFLECTION_GUARD:-1}"
+ENABLE_BITTORRENT_GUARD="${ENABLE_BITTORRENT_GUARD:-1}"
 ENABLE_BBR="${ENABLE_BBR:-1}"
 AUTO_SWAP="${AUTO_SWAP:-1}"
 ENABLE_MAINTENANCE="${ENABLE_MAINTENANCE:-1}"
@@ -196,11 +213,9 @@ ask() {
 ask_secret() {
   local value=""
   if [[ -r /dev/tty ]]; then
-    read -r -s -p "SECRET_KEY из карточки ноды: " value </dev/tty || return 1
-    printf '\n' >/dev/tty
+    read -r -p "SECRET_KEY из карточки ноды (ввод отображается): " value </dev/tty || return 1
   else
-    read -r -s -p "SECRET_KEY из карточки ноды: " value || return 1
-    printf '\n' >&2
+    read -r -p "SECRET_KEY из карточки ноды (ввод отображается): " value || return 1
   fi
   printf '%s' "$value"
 }
@@ -225,7 +240,12 @@ Options:
   --no-hysteria             Не требовать и не проверять Hysteria/UDP
   --no-firewall             Отключить весь firewall installer (control + SMTP guard)
   --allow-smtp              Не блокировать исходящие SMTP-порты
-  --block-smtp-forward      Также блокировать SMTP в FORWARD (dedicated gateway)
+  --block-smtp-forward      Также блокировать SMTP в FORWARD (по умолчанию включено)
+  --no-spamhaus-guard       Не ставить Spamhaus DROP/EDROP egress guard
+  --no-outbound-ssh-guard   Не блокировать исходящий/forwarded TCP/22
+  --no-dns-reflection-guard Не блокировать публичный DNS egress/forward
+  --no-bittorrent-guard     Не ставить BitTorrent copyright-abuse guard
+  --no-antiabuse-guards     Отключить все дополнительные anti-abuse guards
   --no-bbr                  Не применять минимальный BBR sysctl
   --no-swap                 Не создавать небольшой swap на low-RAM VPS
   --no-maintenance          Не ставить безопасную еженедельную гигиену
@@ -240,7 +260,7 @@ Options:
 
 Secrets:
   Передайте SECRET_FILE=/root/node-secret.txt или вставьте SECRET_KEY в
-  скрытом интерактивном запросе. Не передавайте secret аргументом процесса.
+  интерактивном запросе с видимым вводом. Не передавайте secret аргументом процесса.
 
 Compatible one-line command:
   curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | sudo env PANEL_IP=144.31.1.170 bash
@@ -338,6 +358,37 @@ parse_args() {
       --block-smtp-forward)
         BLOCK_SMTP_FORWARD=1
         BLOCK_SMTP_FORWARD_EXPLICIT=1
+        shift
+        ;;
+      --no-spamhaus-guard)
+        ENABLE_SPAMHAUS_EGRESS_GUARD=0
+        ENABLE_SPAMHAUS_EGRESS_GUARD_EXPLICIT=1
+        shift
+        ;;
+      --no-outbound-ssh-guard)
+        ENABLE_OUTBOUND_SSH_GUARD=0
+        ENABLE_OUTBOUND_SSH_GUARD_EXPLICIT=1
+        shift
+        ;;
+      --no-dns-reflection-guard)
+        ENABLE_DNS_REFLECTION_GUARD=0
+        ENABLE_DNS_REFLECTION_GUARD_EXPLICIT=1
+        shift
+        ;;
+      --no-bittorrent-guard)
+        ENABLE_BITTORRENT_GUARD=0
+        ENABLE_BITTORRENT_GUARD_EXPLICIT=1
+        shift
+        ;;
+      --no-antiabuse-guards)
+        ENABLE_SPAMHAUS_EGRESS_GUARD=0
+        ENABLE_OUTBOUND_SSH_GUARD=0
+        ENABLE_DNS_REFLECTION_GUARD=0
+        ENABLE_BITTORRENT_GUARD=0
+        ENABLE_SPAMHAUS_EGRESS_GUARD_EXPLICIT=1
+        ENABLE_OUTBOUND_SSH_GUARD_EXPLICIT=1
+        ENABLE_DNS_REFLECTION_GUARD_EXPLICIT=1
+        ENABLE_BITTORRENT_GUARD_EXPLICIT=1
         shift
         ;;
       --no-bbr)
@@ -589,7 +640,9 @@ port_in_csv() {
 validate_settings() {
   local setting=""
   for setting in YES DRY_RUN ENABLE_XHTTP MANAGE_FIREWALL BLOCK_SMTP_EGRESS \
-    BLOCK_SMTP_FORWARD ENABLE_BBR AUTO_SWAP ENABLE_MAINTENANCE REQUIRE_NODE_PLUGINS \
+    BLOCK_SMTP_FORWARD ENABLE_SPAMHAUS_EGRESS_GUARD ENABLE_OUTBOUND_SSH_GUARD \
+    ENABLE_DNS_REFLECTION_GUARD ENABLE_BITTORRENT_GUARD ENABLE_BBR AUTO_SWAP \
+    ENABLE_MAINTENANCE REQUIRE_NODE_PLUGINS \
     VERIFY_PROFILE_TRANSPORTS REQUIRE_PROFILE_READY EXPECT_HYSTERIA ALLOW_OLD_KERNEL \
     ALLOW_LOW_MEMORY ALLOW_NO_NET_ADMIN ALLOW_CUSTOM_IMAGE RUN_SYSTEM_UPGRADE; do
     bool_valid "${!setting}" || die "$setting должен быть boolean (0/1, true/false, yes/no)."
@@ -666,6 +719,10 @@ load_saved_state() {
   [[ -n "$BLOCK_SMTP_EGRESS_EXPLICIT" || -z "${SAVED_BLOCK_SMTP_EGRESS:-}" ]] || BLOCK_SMTP_EGRESS="$SAVED_BLOCK_SMTP_EGRESS"
   [[ -n "$BLOCK_SMTP_FORWARD_EXPLICIT" || -z "${SAVED_BLOCK_SMTP_FORWARD:-}" ]] || BLOCK_SMTP_FORWARD="$SAVED_BLOCK_SMTP_FORWARD"
   [[ -n "$SMTP_EGRESS_PORTS_EXPLICIT" || -z "${SAVED_SMTP_EGRESS_PORTS:-}" ]] || SMTP_EGRESS_PORTS="$SAVED_SMTP_EGRESS_PORTS"
+  [[ -n "$ENABLE_SPAMHAUS_EGRESS_GUARD_EXPLICIT" || -z "${SAVED_ENABLE_SPAMHAUS_EGRESS_GUARD:-}" ]] || ENABLE_SPAMHAUS_EGRESS_GUARD="$SAVED_ENABLE_SPAMHAUS_EGRESS_GUARD"
+  [[ -n "$ENABLE_OUTBOUND_SSH_GUARD_EXPLICIT" || -z "${SAVED_ENABLE_OUTBOUND_SSH_GUARD:-}" ]] || ENABLE_OUTBOUND_SSH_GUARD="$SAVED_ENABLE_OUTBOUND_SSH_GUARD"
+  [[ -n "$ENABLE_DNS_REFLECTION_GUARD_EXPLICIT" || -z "${SAVED_ENABLE_DNS_REFLECTION_GUARD:-}" ]] || ENABLE_DNS_REFLECTION_GUARD="$SAVED_ENABLE_DNS_REFLECTION_GUARD"
+  [[ -n "$ENABLE_BITTORRENT_GUARD_EXPLICIT" || -z "${SAVED_ENABLE_BITTORRENT_GUARD:-}" ]] || ENABLE_BITTORRENT_GUARD="$SAVED_ENABLE_BITTORRENT_GUARD"
   [[ -n "$ENABLE_BBR_EXPLICIT" || -z "${SAVED_ENABLE_BBR:-}" ]] || ENABLE_BBR="$SAVED_ENABLE_BBR"
   [[ -n "$AUTO_SWAP_EXPLICIT" || -z "${SAVED_AUTO_SWAP:-}" ]] || AUTO_SWAP="$SAVED_AUTO_SWAP"
   [[ -n "$ENABLE_MAINTENANCE_EXPLICIT" || -z "${SAVED_ENABLE_MAINTENANCE:-}" ]] || ENABLE_MAINTENANCE="$SAVED_ENABLE_MAINTENANCE"
@@ -1019,6 +1076,9 @@ print_plan() {
   else
     printf '  SMTP anti-abuse:  disabled together with installer firewall\n'
   fi
+  printf '  anti-abuse guards: spamhaus=%s ssh22=%s dns53=%s bittorrent=%s\n' \
+    "$ENABLE_SPAMHAUS_EGRESS_GUARD" "$ENABLE_OUTBOUND_SSH_GUARD" \
+    "$ENABLE_DNS_REFLECTION_GUARD" "$ENABLE_BITTORRENT_GUARD"
   printf '  BBR baseline:     %s\n' "$ENABLE_BBR"
   printf '  automatic swap:   %s\n' "$AUTO_SWAP"
   printf '  safe maintenance: %s (keep %s backups)\n' "$ENABLE_MAINTENANCE" "$BACKUP_RETENTION"
@@ -1101,9 +1161,6 @@ legacy_paths() {
 /etc/systemd/system/remnanode-offload-tune.service
 /usr/local/sbin/remnanode-mss-clamp.sh
 /etc/systemd/system/remnanode-mss-clamp.service
-/usr/local/sbin/remnanode-spamhaus-egress-guard.sh
-/etc/systemd/system/remnanode-spamhaus-egress-guard.service
-/etc/systemd/system/remnanode-spamhaus-egress-guard.timer
 /usr/local/sbin/remnanode-xhttp-sync.sh
 /etc/systemd/system/remnanode-xhttp-sync.service
 /etc/systemd/system/remnanode-xhttp-sync.timer
@@ -1137,8 +1194,6 @@ remnanode-rps.service
 remnanode-qdisc.service
 remnanode-offload-tune.service
 remnanode-mss-clamp.service
-remnanode-spamhaus-egress-guard.timer
-remnanode-spamhaus-egress-guard.service
 remnanode-xhttp-sync.timer
 remnanode-xhttp-sync.service
 remnanode-compose.service
@@ -1152,6 +1207,11 @@ remnanode-maintenance.timer
 remnanode-xhttp-socket-guard.timer
 remnanode-xhttp-socket-guard.service
 remnanode-firewall.service
+remnanode-spamhaus-egress-guard.timer
+remnanode-spamhaus-egress-guard.service
+remnanode-outbound-ssh-guard.service
+remnanode-dns-reflection-guard.service
+remnanode-bittorrent-guard.service
 docker.service
 docker.socket
 containerd.service
@@ -1177,6 +1237,10 @@ backup_system_paths() {
     "$NGINX_CONF_D_BOOTSTRAP" \
     "$CERT_DEPLOY_HOOK" "$NGINX_CAPACITY_DROPIN" "$MAINTENANCE_SCRIPT" "$MAINTENANCE_SERVICE" \
     "$MAINTENANCE_TIMER" "$XHTTP_GUARD_SCRIPT" "$XHTTP_GUARD_SERVICE" "$XHTTP_GUARD_TIMER" \
+    "$SPAMHAUS_EGRESS_GUARD_SCRIPT" "$SPAMHAUS_EGRESS_GUARD_SERVICE" "$SPAMHAUS_EGRESS_GUARD_TIMER" \
+    "$OUTBOUND_SSH_GUARD_SCRIPT" "$OUTBOUND_SSH_GUARD_SERVICE" \
+    "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" \
+    "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" \
     "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" "$TLS_DIR" "$PANEL_IPS_FILE" \
     /etc/fstab /etc/nginx/nginx.conf /etc/ufw/user.rules /etc/ufw/user6.rules; do
     [[ -e "$path" || -L "$path" ]] || continue
@@ -2259,6 +2323,553 @@ EOF
   fi
   nft list table inet remnanode_installer >/dev/null
   cleanup_installer_ufw_rules "$ufw_comment"
+}
+
+remove_bittorrent_string_runtime() {
+  local bin=""
+  local hook=""
+  local chain=""
+  for bin in iptables ip6tables; do
+    command -v "$bin" >/dev/null 2>&1 || continue
+    for hook in OUTPUT FORWARD; do
+      for chain in REMNANODE_BT_OUT REMNANODE_BT_FWD REMNANODE_BT6_OUT REMNANODE_BT6_FWD; do
+        while "$bin" -w 3 -C "$hook" -j "$chain" >/dev/null 2>&1; do
+          "$bin" -w 3 -D "$hook" -j "$chain" || break
+        done
+      done
+    done
+    for chain in REMNANODE_BT_OUT REMNANODE_BT_FWD REMNANODE_BT6_OUT REMNANODE_BT6_FWD; do
+      "$bin" -w 3 -F "$chain" >/dev/null 2>&1 || true
+      "$bin" -w 3 -X "$chain" >/dev/null 2>&1 || true
+    done
+  done
+}
+
+disable_guard_unit() {
+  local script="$1"
+  local service="$2"
+  local timer="${3:-}"
+  local table="${4:-}"
+  [[ -z "$timer" ]] || systemctl disable --now "$(basename "$timer")" >/dev/null 2>&1 || true
+  systemctl disable --now "$(basename "$service")" >/dev/null 2>&1 || true
+  [[ -z "$table" ]] || nft delete table inet "$table" >/dev/null 2>&1 || true
+  rm -f "$script" "$service"
+  [[ -z "$timer" ]] || rm -f "$timer"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+write_spamhaus_egress_guard() {
+  cat >"$SPAMHAUS_EGRESS_GUARD_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+NFT="$(command -v nft || true)"
+PYTHON="$(command -v python3 || true)"
+[[ -n "$NFT" ]] || { echo "nft is required" >&2; exit 1; }
+[[ -n "$PYTHON" ]] || { echo "python3 is required" >&2; exit 1; }
+
+WORKDIR="$(mktemp -d /tmp/remnanode-spamhaus.XXXXXX)"
+cleanup() { rm -rf "$WORKDIR"; }
+trap cleanup EXIT
+
+RAW="$WORKDIR/raw.txt"
+ELEMENTS="$WORKDIR/drop_v4.nft"
+RULES="$WORKDIR/rules.nft"
+: >"$RAW"
+
+fetch_url() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- "$url"
+  else
+    return 1
+  fi
+}
+
+for url in \
+  "https://www.spamhaus.org/drop/drop.txt" \
+  "https://www.spamhaus.org/drop/edrop.txt"; do
+  fetch_url "$url" >>"$RAW" || true
+  printf '\n' >>"$RAW"
+done
+
+if [[ -s "$RAW" ]]; then
+  "$PYTHON" "$RAW" "$ELEMENTS" <<'PY'
+import ipaddress
+import sys
+
+raw_path, out_path = sys.argv[1:3]
+networks = []
+with open(raw_path, "r", encoding="utf-8", errors="ignore") as handle:
+    for line in handle:
+        item = line.split(";", 1)[0].strip()
+        if not item:
+            continue
+        try:
+            network = ipaddress.ip_network(item, strict=False)
+        except ValueError:
+            continue
+        if network.version == 4:
+            networks.append(network)
+
+collapsed = list(ipaddress.collapse_addresses(networks))
+with open(out_path, "w", encoding="utf-8") as handle:
+    if collapsed:
+        handle.write("elements = { ")
+        handle.write(", ".join(str(network) for network in collapsed))
+        handle.write(" };\n")
+PY
+fi
+
+if "$NFT" list table inet remnanode_spamhaus_egress_guard >/dev/null 2>&1; then
+  printf '%s\n' 'delete table inet remnanode_spamhaus_egress_guard' >"$RULES"
+else
+  : >"$RULES"
+fi
+
+elements_block=""
+if [[ -s "$ELEMENTS" ]]; then
+  elements_block="$(sed 's/^/        /' "$ELEMENTS")"
+else
+  echo "Spamhaus DROP/EDROP list is unavailable or empty; installing empty guard table and keeping timer refresh enabled." >&2
+fi
+
+cat >>"$RULES" <<NFT
+table inet remnanode_spamhaus_egress_guard {
+    set drop_v4 {
+        type ipv4_addr;
+        flags interval;
+        auto-merge;
+$elements_block
+    }
+
+    chain output {
+        type filter hook output priority -11; policy accept;
+        ip daddr @drop_v4 counter reject with icmpx type admin-prohibited
+    }
+
+    chain forward {
+        type filter hook forward priority -11; policy accept;
+        ip daddr @drop_v4 counter reject with icmpx type admin-prohibited
+    }
+}
+NFT
+
+"$NFT" -c -f "$RULES"
+"$NFT" -f "$RULES"
+EOF
+  chmod 0700 "$SPAMHAUS_EGRESS_GUARD_SCRIPT"
+
+  cat >"$SPAMHAUS_EGRESS_GUARD_SERVICE" <<EOF
+[Unit]
+Description=RemnaNode Spamhaus DROP/EDROP egress guard
+Documentation=man:nft(8)
+After=network-online.target nftables.service
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$SPAMHAUS_EGRESS_GUARD_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat >"$SPAMHAUS_EGRESS_GUARD_TIMER" <<'EOF'
+[Unit]
+Description=Refresh RemnaNode Spamhaus DROP/EDROP egress guard
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=12h
+RandomizedDelaySec=30min
+Persistent=true
+Unit=remnanode-spamhaus-egress-guard.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable remnanode-spamhaus-egress-guard.service >/dev/null
+  systemctl enable --now remnanode-spamhaus-egress-guard.timer >/dev/null
+  systemctl start remnanode-spamhaus-egress-guard.service || \
+    warn "Spamhaus guard не смог обновить список сейчас; timer повторит попытку позже."
+}
+
+write_outbound_ssh_guard() {
+  cat >"$OUTBOUND_SSH_GUARD_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+NFT="$(command -v nft || true)"
+[[ -n "$NFT" ]] || { echo "nft is required" >&2; exit 1; }
+
+RULES="$(mktemp)"
+cleanup() { rm -f "$RULES"; }
+trap cleanup EXIT
+
+if "$NFT" list table inet remnanode_outbound_ssh_guard >/dev/null 2>&1; then
+  printf '%s\n' 'delete table inet remnanode_outbound_ssh_guard' >"$RULES"
+else
+  : >"$RULES"
+fi
+
+cat >>"$RULES" <<'NFT'
+table inet remnanode_outbound_ssh_guard {
+    chain output {
+        type filter hook output priority -8; policy accept;
+        tcp dport 22 counter reject with icmpx type admin-prohibited
+    }
+
+    chain forward {
+        type filter hook forward priority -8; policy accept;
+        tcp dport 22 counter reject with icmpx type admin-prohibited
+    }
+}
+NFT
+
+"$NFT" -c -f "$RULES"
+"$NFT" -f "$RULES"
+EOF
+  chmod 0700 "$OUTBOUND_SSH_GUARD_SCRIPT"
+
+  cat >"$OUTBOUND_SSH_GUARD_SERVICE" <<EOF
+[Unit]
+Description=RemnaNode outbound SSH brute-force guard
+Documentation=man:nft(8)
+After=network-online.target nftables.service
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$OUTBOUND_SSH_GUARD_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now remnanode-outbound-ssh-guard.service >/dev/null
+  systemctl restart remnanode-outbound-ssh-guard.service
+}
+
+write_dns_reflection_guard() {
+  cat >"$DNS_REFLECTION_GUARD_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+NFT="$(command -v nft || true)"
+PYTHON="$(command -v python3 || true)"
+[[ -n "$NFT" ]] || { echo "nft is required" >&2; exit 1; }
+[[ -n "$PYTHON" ]] || { echo "python3 is required" >&2; exit 1; }
+
+WORKDIR="$(mktemp -d /tmp/remnanode-dns-guard.XXXXXX)"
+cleanup() { rm -rf "$WORKDIR"; }
+trap cleanup EXIT
+
+RAW="$WORKDIR/resolvers.raw"
+ALLOW_V4="$WORKDIR/resolver_v4.nft"
+ALLOW_V6="$WORKDIR/resolver_v6.nft"
+RULES="$WORKDIR/rules.nft"
+: >"$RAW"
+
+if command -v resolvectl >/dev/null 2>&1; then
+  resolvectl dns 2>/dev/null | tr ' ' '\n' | sed 's/%.*//' >>"$RAW" || true
+fi
+awk '$1 == "nameserver" {print $2}' /etc/resolv.conf 2>/dev/null >>"$RAW" || true
+
+"$PYTHON" "$RAW" "$ALLOW_V4" "$ALLOW_V6" <<'PY'
+import ipaddress
+import sys
+
+raw_path, v4_path, v6_path = sys.argv[1:4]
+v4 = []
+v6 = []
+with open(raw_path, "r", encoding="utf-8", errors="ignore") as handle:
+    for token in handle.read().replace(",", " ").split():
+        token = token.strip("[]")
+        try:
+            addr = ipaddress.ip_address(token)
+        except ValueError:
+            continue
+        if addr.is_loopback:
+            continue
+        if addr.version == 4:
+            v4.append(ipaddress.ip_network(f"{addr}/32", strict=False))
+        else:
+            v6.append(ipaddress.ip_network(f"{addr}/128", strict=False))
+
+def write(path, networks):
+    collapsed = list(ipaddress.collapse_addresses(networks))
+    with open(path, "w", encoding="utf-8") as handle:
+        if collapsed:
+            handle.write("elements = { ")
+            handle.write(", ".join(str(network) for network in collapsed))
+            handle.write(" };\n")
+
+write(v4_path, v4)
+write(v6_path, v6)
+PY
+
+resolver_v4_block=""
+resolver_v6_block=""
+[[ ! -s "$ALLOW_V4" ]] || resolver_v4_block="$(sed 's/^/        /' "$ALLOW_V4")"
+[[ ! -s "$ALLOW_V6" ]] || resolver_v6_block="$(sed 's/^/        /' "$ALLOW_V6")"
+
+resolved_uid=""
+for user in systemd-resolve systemd-resolved; do
+  if resolved_uid="$(id -u "$user" 2>/dev/null)"; then
+    break
+  fi
+  resolved_uid=""
+done
+
+resolver_rules=""
+if [[ "$resolved_uid" =~ ^[0-9]+$ ]]; then
+  resolver_rules+="        meta skuid $resolved_uid udp dport 53 accept"$'\n'
+  resolver_rules+="        meta skuid $resolved_uid tcp dport 53 accept"
+else
+  [[ ! -s "$ALLOW_V4" ]] || resolver_rules+="        ip daddr @resolver_v4 udp dport 53 accept"$'\n        ip daddr @resolver_v4 tcp dport 53 accept'$'\n'
+  [[ ! -s "$ALLOW_V6" ]] || resolver_rules+="        ip6 daddr @resolver_v6 udp dport 53 accept"$'\n        ip6 daddr @resolver_v6 tcp dport 53 accept'
+fi
+
+if "$NFT" list table inet remnanode_dns_reflection_guard >/dev/null 2>&1; then
+  printf '%s\n' 'delete table inet remnanode_dns_reflection_guard' >"$RULES"
+else
+  : >"$RULES"
+fi
+
+cat >>"$RULES" <<NFT
+table inet remnanode_dns_reflection_guard {
+    set resolver_v4 {
+        type ipv4_addr;
+        flags interval;
+        auto-merge;
+$resolver_v4_block
+    }
+
+    set resolver_v6 {
+        type ipv6_addr;
+        flags interval;
+        auto-merge;
+$resolver_v6_block
+    }
+
+    chain output {
+        type filter hook output priority -9; policy accept;
+        oifname "lo" udp dport 53 accept
+        oifname "lo" tcp dport 53 accept
+        ip daddr 127.0.0.0/8 udp dport 53 accept
+        ip daddr 127.0.0.0/8 tcp dport 53 accept
+        ip6 daddr ::1 udp dport 53 accept
+        ip6 daddr ::1 tcp dport 53 accept
+$resolver_rules
+        udp dport 53 counter reject with icmpx type admin-prohibited
+        tcp dport 53 counter reject with icmpx type admin-prohibited
+    }
+
+    chain forward {
+        type filter hook forward priority -9; policy accept;
+        udp dport 53 counter reject with icmpx type admin-prohibited
+        tcp dport 53 counter reject with icmpx type admin-prohibited
+    }
+}
+NFT
+
+"$NFT" -c -f "$RULES"
+"$NFT" -f "$RULES"
+EOF
+  chmod 0700 "$DNS_REFLECTION_GUARD_SCRIPT"
+
+  cat >"$DNS_REFLECTION_GUARD_SERVICE" <<EOF
+[Unit]
+Description=RemnaNode DNS reflection/amplification egress guard
+Documentation=man:nft(8)
+After=network-online.target nftables.service systemd-resolved.service
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$DNS_REFLECTION_GUARD_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now remnanode-dns-reflection-guard.service >/dev/null
+  systemctl restart remnanode-dns-reflection-guard.service
+}
+
+write_bittorrent_guard() {
+  cat >"$BITTORRENT_GUARD_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+NFT="$(command -v nft || true)"
+IPTABLES="$(command -v iptables || true)"
+IP6TABLES="$(command -v ip6tables || true)"
+[[ -n "$NFT" ]] || { echo "nft is required" >&2; exit 1; }
+
+RULES="$(mktemp)"
+cleanup() { rm -f "$RULES"; }
+trap cleanup EXIT
+
+remove_string_rules() {
+  local bin="$1"
+  local out_chain="$2"
+  local fwd_chain="$3"
+  local hook=""
+  local chain=""
+  [[ -n "$bin" ]] || return 0
+  for hook in OUTPUT FORWARD; do
+    for chain in "$out_chain" "$fwd_chain"; do
+      while "$bin" -w 3 -C "$hook" -j "$chain" >/dev/null 2>&1; do
+        "$bin" -w 3 -D "$hook" -j "$chain" || break
+      done
+    done
+  done
+  for chain in "$out_chain" "$fwd_chain"; do
+    "$bin" -w 3 -F "$chain" >/dev/null 2>&1 || true
+    "$bin" -w 3 -X "$chain" >/dev/null 2>&1 || true
+  done
+}
+
+install_string_rules() {
+  local bin="$1"
+  local out_chain="$2"
+  local fwd_chain="$3"
+  local chain=""
+  local pat=""
+  local -a patterns=(
+    "BitTorrent protocol"
+    "peer_id="
+    "info_hash="
+    "announce_peer"
+    "get_peers"
+    "find_node"
+    "d1:ad2:id20"
+    ".torrent"
+  )
+  [[ -n "$bin" ]] || return 0
+  remove_string_rules "$bin" "$out_chain" "$fwd_chain"
+  if ! "$bin" -w 3 -N "$out_chain" >/dev/null 2>&1 || \
+     ! "$bin" -w 3 -N "$fwd_chain" >/dev/null 2>&1 || \
+     ! "$bin" -w 3 -I OUTPUT 1 -j "$out_chain" >/dev/null 2>&1 || \
+     ! "$bin" -w 3 -I FORWARD 1 -j "$fwd_chain" >/dev/null 2>&1; then
+    remove_string_rules "$bin" "$out_chain" "$fwd_chain"
+    echo "BitTorrent string guard skipped for $bin: chain setup failed." >&2
+    return 0
+  fi
+  for chain in "$out_chain" "$fwd_chain"; do
+    for pat in "${patterns[@]}"; do
+      if ! "$bin" -w 3 -A "$chain" -m string --algo bm --string "$pat" -j DROP; then
+        remove_string_rules "$bin" "$out_chain" "$fwd_chain"
+        echo "BitTorrent string guard skipped for $bin: string match is unavailable." >&2
+        return 0
+      fi
+    done
+    "$bin" -w 3 -A "$chain" -j RETURN
+  done
+}
+
+if "$NFT" list table inet remnanode_bittorrent_guard >/dev/null 2>&1; then
+  printf '%s\n' 'delete table inet remnanode_bittorrent_guard' >"$RULES"
+else
+  : >"$RULES"
+fi
+
+cat >>"$RULES" <<'NFT'
+table inet remnanode_bittorrent_guard {
+    chain output {
+        type filter hook output priority -7; policy accept;
+        tcp dport 6881-6999 counter reject with icmpx type admin-prohibited
+        udp dport 6881-6999 counter reject with icmpx type admin-prohibited
+        tcp dport { 2710, 6969, 16881, 51413 } counter reject with icmpx type admin-prohibited
+        udp dport { 2710, 6969, 16881, 51413 } counter reject with icmpx type admin-prohibited
+    }
+
+    chain forward {
+        type filter hook forward priority -7; policy accept;
+        tcp dport 6881-6999 counter reject with icmpx type admin-prohibited
+        udp dport 6881-6999 counter reject with icmpx type admin-prohibited
+        tcp dport { 2710, 6969, 16881, 51413 } counter reject with icmpx type admin-prohibited
+        udp dport { 2710, 6969, 16881, 51413 } counter reject with icmpx type admin-prohibited
+    }
+}
+NFT
+
+"$NFT" -c -f "$RULES"
+"$NFT" -f "$RULES"
+install_string_rules "$IPTABLES" REMNANODE_BT_OUT REMNANODE_BT_FWD
+install_string_rules "$IP6TABLES" REMNANODE_BT6_OUT REMNANODE_BT6_FWD
+EOF
+  chmod 0700 "$BITTORRENT_GUARD_SCRIPT"
+
+  cat >"$BITTORRENT_GUARD_SERVICE" <<EOF
+[Unit]
+Description=RemnaNode BitTorrent copyright-abuse egress guard
+Documentation=man:nft(8) man:iptables(8)
+After=network-online.target nftables.service
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$BITTORRENT_GUARD_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now remnanode-bittorrent-guard.service >/dev/null
+  systemctl restart remnanode-bittorrent-guard.service
+}
+
+configure_antiabuse_guards() {
+  if bool_true "$ENABLE_SPAMHAUS_EGRESS_GUARD"; then
+    write_spamhaus_egress_guard
+  else
+    disable_guard_unit "$SPAMHAUS_EGRESS_GUARD_SCRIPT" "$SPAMHAUS_EGRESS_GUARD_SERVICE" \
+      "$SPAMHAUS_EGRESS_GUARD_TIMER" remnanode_spamhaus_egress_guard
+  fi
+
+  if bool_true "$ENABLE_OUTBOUND_SSH_GUARD"; then
+    write_outbound_ssh_guard
+  else
+    disable_guard_unit "$OUTBOUND_SSH_GUARD_SCRIPT" "$OUTBOUND_SSH_GUARD_SERVICE" "" \
+      remnanode_outbound_ssh_guard
+  fi
+
+  if bool_true "$ENABLE_DNS_REFLECTION_GUARD"; then
+    write_dns_reflection_guard
+  else
+    disable_guard_unit "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" "" \
+      remnanode_dns_reflection_guard
+  fi
+
+  if bool_true "$ENABLE_BITTORRENT_GUARD"; then
+    write_bittorrent_guard
+  else
+    disable_guard_unit "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" "" \
+      remnanode_bittorrent_guard
+    remove_bittorrent_string_runtime
+  fi
 }
 
 check_xhttp_port_conflicts() {
@@ -3508,6 +4119,10 @@ write_state() {
     printf 'SAVED_BLOCK_SMTP_EGRESS=%q\n' "$BLOCK_SMTP_EGRESS"
     printf 'SAVED_BLOCK_SMTP_FORWARD=%q\n' "$BLOCK_SMTP_FORWARD"
     printf 'SAVED_SMTP_EGRESS_PORTS=%q\n' "$SMTP_EGRESS_PORTS"
+    printf 'SAVED_ENABLE_SPAMHAUS_EGRESS_GUARD=%q\n' "$ENABLE_SPAMHAUS_EGRESS_GUARD"
+    printf 'SAVED_ENABLE_OUTBOUND_SSH_GUARD=%q\n' "$ENABLE_OUTBOUND_SSH_GUARD"
+    printf 'SAVED_ENABLE_DNS_REFLECTION_GUARD=%q\n' "$ENABLE_DNS_REFLECTION_GUARD"
+    printf 'SAVED_ENABLE_BITTORRENT_GUARD=%q\n' "$ENABLE_BITTORRENT_GUARD"
     printf 'SAVED_ENABLE_BBR=%q\n' "$ENABLE_BBR"
     printf 'SAVED_AUTO_SWAP=%q\n' "$AUTO_SWAP"
     printf 'SAVED_ENABLE_MAINTENANCE=%q\n' "$ENABLE_MAINTENANCE"
@@ -3604,6 +4219,10 @@ show_status() {
   local firewall="inactive"
   local maintenance="inactive"
   local xhttp_guard="inactive"
+  local spamhaus_guard="inactive"
+  local outbound_ssh_guard="inactive"
+  local dns_reflection_guard="inactive"
+  local bittorrent_guard="inactive"
   local bbr=""
   bbr="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '-')"
 
@@ -3635,6 +4254,14 @@ PY
   nft list table inet remnanode_installer >/dev/null 2>&1 && firewall="active"
   systemctl is-active --quiet remnanode-maintenance.timer 2>/dev/null && maintenance="active"
   systemctl is-active --quiet remnanode-xhttp-socket-guard.timer 2>/dev/null && xhttp_guard="active"
+  if nft list table inet remnanode_spamhaus_egress_guard >/dev/null 2>&1; then
+    spamhaus_guard="active"
+  elif systemctl is-active --quiet remnanode-spamhaus-egress-guard.timer 2>/dev/null; then
+    spamhaus_guard="timer-active"
+  fi
+  nft list table inet remnanode_outbound_ssh_guard >/dev/null 2>&1 && outbound_ssh_guard="active"
+  nft list table inet remnanode_dns_reflection_guard >/dev/null 2>&1 && dns_reflection_guard="active"
+  nft list table inet remnanode_bittorrent_guard >/dev/null 2>&1 && bittorrent_guard="active"
 
   printf 'Installer:       %s\n' "$INSTALLER_VERSION"
   printf 'Container:       %s\n' "$state"
@@ -3647,6 +4274,10 @@ PY
   printf 'Node Plugins:    %s\n' "$plugin_state"
   printf 'BBR/TCP CC:      %s\n' "$bbr"
   printf 'Firewall:        %s\n' "$firewall"
+  printf 'Spamhaus guard:  %s\n' "$spamhaus_guard"
+  printf 'SSH egress:      %s\n' "$outbound_ssh_guard"
+  printf 'DNS egress:      %s\n' "$dns_reflection_guard"
+  printf 'BitTorrent:      %s\n' "$bittorrent_guard"
   printf 'Maintenance:     %s\n' "$maintenance"
   printf 'xHTTP recovery:  %s\n' "$xhttp_guard"
   if legacy_reboot_required; then
@@ -3721,6 +4352,7 @@ run_install() {
   write_logrotate
   configure_log_hygiene_and_maintenance
   write_firewall
+  configure_antiabuse_guards
   configure_xhttp_module
   select_and_pull_image
   render_node_files
