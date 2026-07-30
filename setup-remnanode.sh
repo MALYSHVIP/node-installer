@@ -2397,7 +2397,7 @@ for url in \
 done
 
 if [[ -s "$RAW" ]]; then
-  "$PYTHON" "$RAW" "$ELEMENTS" <<'PY'
+  "$PYTHON" - "$RAW" "$ELEMENTS" <<'PY'
 import ipaddress
 import sys
 
@@ -2448,11 +2448,13 @@ $elements_block
 
     chain output {
         type filter hook output priority -11; policy accept;
+        ct state established,related accept
         ip daddr @drop_v4 counter reject with icmpx type admin-prohibited
     }
 
     chain forward {
         type filter hook forward priority -11; policy accept;
+        ct state established,related accept
         ip daddr @drop_v4 counter reject with icmpx type admin-prohibited
     }
 }
@@ -2588,7 +2590,7 @@ if command -v resolvectl >/dev/null 2>&1; then
 fi
 awk '$1 == "nameserver" {print $2}' /etc/resolv.conf 2>/dev/null >>"$RAW" || true
 
-"$PYTHON" "$RAW" "$ALLOW_V4" "$ALLOW_V6" <<'PY'
+"$PYTHON" - "$RAW" "$ALLOW_V4" "$ALLOW_V6" <<'PY'
 import ipaddress
 import sys
 
