@@ -159,6 +159,7 @@ BACKUP_HAS_SYSTEM_FILES=0
 TLS_MIN_VALID_SECONDS=604800
 NGINX_RESTART_REQUIRED=0
 NGINX_LOCK_FD=""
+APT_LAST_LOG=""
 
 log() {
   printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
@@ -197,6 +198,127 @@ trim() {
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
   printf '%s' "$value"
+}
+
+unit_known_to_systemd() {
+  local unit="$1"
+  systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q . && return 0
+  systemctl list-units --all "$unit" --no-legend 2>/dev/null | grep -q . && return 0
+  return 1
+}
+
+apt_log_dir() {
+  local base="$STATE_DIR/apt-logs"
+  if [[ -n "$BACKUP_DIR" ]]; then
+    base="$BACKUP_DIR/apt-logs"
+  fi
+  install -d -m 0700 "$base"
+  printf '%s' "$base"
+}
+
+apt_log_path_for_attempt() {
+  local label="$1"
+  local dir=""
+  dir="$(apt_log_dir)"
+  printf '%s/%s-%s-$$.log' "$dir" "$label" "$(date -u +%Y%m%dT%H%M%SZ)"
+}
+
+apt_output_contains_dns_error() {
+  local log_file="$1"
+  [[ -r "$log_file" ]] || return 1
+  grep -Eiq 'Temporary failure resolving|Could not resolve|Name or service not known|No address associated with hostname|Failure resolving' "$log_file"
+}
+
+collect_apt_repo_hosts() {
+  local file=""
+  local line=""
+  local token=""
+  local host=""
+  local result=""
+
+  for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [[ -r "$file" ]] || continue
+    while IFS= read -r line; do
+      line="${line%%#*}"
+      line="$(trim "$line")"
+      [[ -n "$line" ]] || continue
+      case "$line" in
+        URIs:*)
+          line="${line#URIs:}"
+          ;;
+      esac
+      for token in $line; do
+        case "$token" in
+          http://*|https://*)
+            host="${token#*://}"
+            host="${host%%/*}"
+            host="${host%%:*}"
+            host="${host#[}"
+            host="${host%]}"
+            [[ -n "$host" ]] || continue
+            case " $result " in
+              *" $host "*) ;;
+              *) result+=" $host" ;;
+            esac
+            ;;
+        esac
+      done
+    done <"$file"
+  done
+
+  result="$(trim "$result")"
+  [[ -n "$result" ]] || result="archive.ubuntu.com security.ubuntu.com deb.debian.org"
+  printf '%s\n' $result
+}
+
+host_resolves_via_glibc() {
+  local host="$1"
+  getent ahostsv4 "$host" >/dev/null 2>&1 || \
+    getent ahosts "$host" >/dev/null 2>&1 || \
+    getent hosts "$host" >/dev/null 2>&1
+}
+
+first_unresolved_apt_host() {
+  local host=""
+  while IFS= read -r host; do
+    [[ -n "$host" ]] || continue
+    host_resolves_via_glibc "$host" || {
+      printf '%s' "$host"
+      return 1
+    }
+  done < <(collect_apt_repo_hosts)
+  return 0
+}
+
+prepare_package_network() {
+  local unresolved_host=""
+
+  unresolved_host="$(first_unresolved_apt_host || true)"
+  [[ -z "$unresolved_host" ]] && return 0
+
+  if command -v nft >/dev/null 2>&1 && nft list table inet remnanode_dns_reflection_guard >/dev/null 2>&1; then
+    if command -v resolvectl >/dev/null 2>&1 && resolvectl query "$unresolved_host" >/dev/null 2>&1; then
+      warn "Обнаружен конфликт DNS guard с glibc/APT: resolvectl разрешает $unresolved_host, но системный resolver нет. Временно снимаю stale DNS guard до завершения apt-этапа."
+    else
+      warn "Системный resolver не может разрешить $unresolved_host. Временно снимаю stale DNS guard перед apt."
+    fi
+    nft delete table inet remnanode_dns_reflection_guard >/dev/null 2>&1 || true
+    systemctl stop remnanode-dns-reflection-guard.service >/dev/null 2>&1 || true
+    sleep 1
+    unresolved_host="$(first_unresolved_apt_host || true)"
+    [[ -z "$unresolved_host" ]] && return 0
+  fi
+
+  if systemctl is-active --quiet systemd-resolved.service 2>/dev/null; then
+    resolvectl flush-caches >/dev/null 2>&1 || true
+    systemctl restart systemd-resolved.service >/dev/null 2>&1 || true
+    sleep 1
+    unresolved_host="$(first_unresolved_apt_host || true)"
+    [[ -z "$unresolved_host" ]] && return 0
+  fi
+
+  warn "APT/DNS preflight: системный resolver всё ещё не может разрешить $unresolved_host. Проверьте /etc/resolv.conf, upstream DNS и egress до 53/tcp+udp."
+  return 1
 }
 
 ask() {
@@ -1098,8 +1220,27 @@ print_plan() {
 apt_retry() {
   local attempt=1
   local max=4
-  until apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_TIMEOUT" "$@"; do
-    (( attempt >= max )) && return 1
+  local rc=0
+  local log_path=""
+
+  while :; do
+    if ! prepare_package_network; then
+      warn "DNS preflight не смог полностью восстановить resolver; продолжаю попытку apt и сохраню подробный лог ошибки."
+    fi
+    log_path="$(apt_log_path_for_attempt "apt-${attempt}")"
+    APT_LAST_LOG="$log_path"
+    if apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_TIMEOUT" "$@" 2>&1 | tee "$log_path"; then
+      return 0
+    fi
+    rc=$?
+    if apt_output_contains_dns_error "$log_path"; then
+      warn "apt-get $* завершился DNS-ошибкой; пробую восстановить resolver и повторить."
+      prepare_package_network || true
+    fi
+    if (( attempt >= max )); then
+      warn "Последний лог apt сохранён: $log_path"
+      return "$rc"
+    fi
     warn "apt-get $* не выполнен, повтор $attempt/$max"
     sleep $((attempt * 4))
     ((attempt++))
@@ -1653,12 +1794,27 @@ rollback_from_backup() {
     systemctl restart systemd-resolved.service >/dev/null 2>&1 || rollback_failed=1
   fi
   for unit in $previous_legacy_enabled_units; do
-    systemctl enable "$unit" >/dev/null 2>&1 || rollback_failed=1
+    if unit_known_to_systemd "$unit"; then
+      systemctl enable "$unit" >/dev/null 2>&1 || rollback_failed=1
+    else
+      rollback_failed=1
+    fi
   done
   for unit in $previous_legacy_active_units; do
-    systemctl start "$unit" >/dev/null 2>&1 || rollback_failed=1
+    if unit_known_to_systemd "$unit"; then
+      systemctl start "$unit" >/dev/null 2>&1 || rollback_failed=1
+    else
+      rollback_failed=1
+    fi
   done
   while IFS= read -r unit; do
+    if ! unit_known_to_systemd "$unit"; then
+      if [[ " $previous_managed_enabled_units " == *" $unit "* || \
+            " $previous_managed_active_units " == *" $unit "* ]]; then
+        rollback_failed=1
+      fi
+      continue
+    fi
     if [[ " $previous_managed_enabled_units " == *" $unit "* ]]; then
       systemctl enable "$unit" >/dev/null 2>&1 || rollback_failed=1
     else
@@ -1680,14 +1836,21 @@ rollback_from_backup() {
     fi
   done < <(managed_units)
   while IFS= read -r unit; do
+    if ! unit_known_to_systemd "$unit"; then
+      if [[ " $previous_managed_enabled_units " == *" $unit "* || \
+            " $previous_managed_active_units " == *" $unit "* ]]; then
+        rollback_failed=1
+      fi
+      continue
+    fi
     if [[ " $previous_managed_active_units " == *" $unit "* ]]; then
-      systemctl is-active --quiet "$unit" || rollback_failed=1
-    elif systemctl is-active --quiet "$unit"; then
+      systemctl is-active --quiet "$unit" >/dev/null 2>&1 || rollback_failed=1
+    elif systemctl is-active --quiet "$unit" >/dev/null 2>&1; then
       rollback_failed=1
     fi
     if [[ " $previous_managed_enabled_units " == *" $unit "* ]]; then
-      systemctl is-enabled --quiet "$unit" || rollback_failed=1
-    elif systemctl is-enabled --quiet "$unit"; then
+      systemctl is-enabled --quiet "$unit" >/dev/null 2>&1 || rollback_failed=1
+    elif systemctl is-enabled --quiet "$unit" >/dev/null 2>&1; then
       rollback_failed=1
     fi
   done < <(managed_units)
@@ -1738,6 +1901,9 @@ on_error() {
   local line="$2"
   trap - ERR INT TERM
   printf '\n[ERROR] Installer остановлен на строке %s (код %s).\n' "$line" "$rc" >&2
+  if [[ -n "$APT_LAST_LOG" && -r "$APT_LAST_LOG" ]]; then
+    printf '[ERROR] Последний apt log: %s\n' "$APT_LAST_LOG" >&2
+  fi
   if [[ "$MUTATION_STARTED" == "1" && "$ROLLBACK_RUNNING" == "0" && -n "$BACKUP_DIR" ]]; then
     rollback_from_backup "$BACKUP_DIR"
   fi
@@ -2589,6 +2755,14 @@ if command -v resolvectl >/dev/null 2>&1; then
   resolvectl dns 2>/dev/null | tr ' ' '\n' | sed 's/%.*//' >>"$RAW" || true
 fi
 awk '$1 == "nameserver" {print $2}' /etc/resolv.conf 2>/dev/null >>"$RAW" || true
+if ! grep -Eq '[0-9A-Fa-f:.]' "$RAW"; then
+  cat >>"$RAW" <<'RESOLVERS'
+1.1.1.1
+1.0.0.1
+8.8.8.8
+8.8.4.4
+RESOLVERS
+fi
 
 "$PYTHON" - "$RAW" "$ALLOW_V4" "$ALLOW_V6" <<'PY'
 import ipaddress
@@ -2637,12 +2811,13 @@ for user in systemd-resolve systemd-resolved; do
 done
 
 resolver_rules=""
+[[ ! -s "$ALLOW_V4" ]] || resolver_rules+="        ip daddr @resolver_v4 udp dport 53 accept"$'\n        ip daddr @resolver_v4 tcp dport 53 accept'$'\n'
+[[ ! -s "$ALLOW_V6" ]] || resolver_rules+="        ip6 daddr @resolver_v6 udp dport 53 accept"$'\n        ip6 daddr @resolver_v6 tcp dport 53 accept'$'\n'
+# Keep direct resolver access for glibc/apt in resolv.conf foreign mode, while
+# also allowing systemd-resolved to reach dynamically learned upstreams.
 if [[ "$resolved_uid" =~ ^[0-9]+$ ]]; then
   resolver_rules+="        meta skuid $resolved_uid udp dport 53 accept"$'\n'
   resolver_rules+="        meta skuid $resolved_uid tcp dport 53 accept"
-else
-  [[ ! -s "$ALLOW_V4" ]] || resolver_rules+="        ip daddr @resolver_v4 udp dport 53 accept"$'\n        ip daddr @resolver_v4 tcp dport 53 accept'$'\n'
-  [[ ! -s "$ALLOW_V6" ]] || resolver_rules+="        ip6 daddr @resolver_v6 udp dport 53 accept"$'\n        ip6 daddr @resolver_v6 tcp dport 53 accept'
 fi
 
 if "$NFT" list table inet remnanode_dns_reflection_guard >/dev/null 2>&1; then
