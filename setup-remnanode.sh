@@ -1170,7 +1170,15 @@ preflight_host() {
     die "Обнаружен активный firewalld. Отключите его или запустите с --no-firewall и настройте ${NODE_PORT}/tcp вручную."
   fi
   if command -v docker >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
-    die "Docker установлен, но daemon недоступен. Безопасный backup существующего контейнера невозможен; запустите Docker и повторите."
+    warn "Docker установлен, но daemon пока недоступен. Пытаюсь безопасно поднять Docker перед backup/preflight."
+    systemctl enable containerd.service >/dev/null 2>&1 || true
+    systemctl start containerd.service >/dev/null 2>&1 || true
+    systemctl enable docker.socket >/dev/null 2>&1 || true
+    systemctl enable docker.service >/dev/null 2>&1 || true
+    systemctl start docker.service >/dev/null 2>&1 || true
+    sleep 2
+    docker info >/dev/null 2>&1 || \
+      die "Docker установлен, но daemon недоступен даже после автоматического запуска. Проверьте systemctl status docker containerd."
   fi
   if command -v ss >/dev/null 2>&1; then
     control_listener="$(ss -H -ltnp "( sport = :$NODE_PORT )" 2>/dev/null | head -n1 || true)"
