@@ -1259,7 +1259,7 @@ install_base_packages() {
   log "Устанавливаю минимальные зависимости"
   apt_retry update
   apt_retry install -y --no-install-recommends \
-    ca-certificates curl gnupg iproute2 iptables nftables openssl \
+    ca-certificates curl ethtool gnupg iproute2 iptables nftables openssl \
     python3 procps kmod logrotate tar gzip util-linux
 
   if bool_true "$RUN_SYSTEM_UPGRADE"; then
@@ -1414,11 +1414,14 @@ net.core.netdev_max_backlog
 net.core.rmem_max
 net.core.wmem_max
 net.ipv4.ip_local_port_range
+net.ipv4.tcp_fastopen
+net.ipv4.tcp_fin_timeout
 net.ipv4.tcp_keepalive_time
 net.ipv4.tcp_keepalive_intvl
 net.ipv4.tcp_keepalive_probes
 net.ipv4.tcp_max_syn_backlog
 net.ipv4.tcp_mtu_probing
+net.ipv4.tcp_slow_start_after_idle
 net.ipv4.tcp_rmem
 net.ipv4.tcp_wmem
 net.ipv4.udp_rmem_min
@@ -2117,11 +2120,14 @@ configure_minimal_sysctl() {
     printf 'net.core.rmem_max = %s\n' "$socket_max"
     printf 'net.core.wmem_max = %s\n' "$socket_max"
     printf 'net.ipv4.ip_local_port_range = 10240 65535\n'
-    printf 'net.ipv4.tcp_keepalive_time = 600\n'
+    printf 'net.ipv4.tcp_fastopen = 3\n'
+    printf 'net.ipv4.tcp_fin_timeout = 15\n'
+    printf 'net.ipv4.tcp_keepalive_time = 120\n'
     printf 'net.ipv4.tcp_keepalive_intvl = 30\n'
     printf 'net.ipv4.tcp_keepalive_probes = 5\n'
     printf 'net.ipv4.tcp_max_syn_backlog = %s\n' "$syn_backlog"
     printf 'net.ipv4.tcp_mtu_probing = 1\n'
+    printf 'net.ipv4.tcp_slow_start_after_idle = 0\n'
     printf 'net.ipv4.tcp_rmem = 4096 131072 %s\n' "$socket_max"
     printf 'net.ipv4.tcp_wmem = 4096 65536 %s\n' "$socket_max"
     printf 'net.ipv4.udp_rmem_min = 16384\n'
@@ -2759,10 +2765,64 @@ ALLOW_V6="$WORKDIR/resolver_v6.nft"
 RULES="$WORKDIR/rules.nft"
 : >"$RAW"
 
+collect_live_xray_dns() {
+  local pid=""
+  local line=""
+  local sock=""
+  local token=""
+  command -v docker >/dev/null 2>&1 || return 0
+  command -v nsenter >/dev/null 2>&1 || return 0
+  docker inspect remnanode >/dev/null 2>&1 || return 0
+  pid="$(docker inspect -f '{{.State.Pid}}' remnanode 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || return 0
+  line="$(docker top remnanode -eo pid,args 2>/dev/null | awk '/\/usr\/local\/bin\/rw-core/ {print; exit}')"
+  [[ -n "$line" ]] || return 0
+  sock="$(printf '%s\n' "$line" | sed -n 's/.*-config @\([^:]*\):\/internal\/get-config.*/\1/p')"
+  token="$(printf '%s\n' "$line" | sed -n 's/.*token=\([A-Za-z0-9]*\).*/\1/p')"
+  [[ -n "$sock" && -n "$token" ]] || return 0
+  nsenter -t "$pid" -n curl -fsS --max-time 10 \
+    --abstract-unix-socket "$sock" \
+    "http://localhost/internal/get-config?token=$token" 2>/dev/null | \
+    "$PYTHON" -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+
+for item in payload.get("dns", {}).get("servers") or []:
+    if isinstance(item, str):
+        print(item)
+        continue
+    if isinstance(item, dict):
+        address = item.get("address") or item.get("Address")
+        if isinstance(address, str):
+            print(address)
+' || true
+}
+
+# Keep a conservative built-in resolver fallback so the guard never breaks
+# common public-recursive DNS choices used by Xray profiles.
+cat >>"$RAW" <<'RESOLVERS'
+1.1.1.1
+1.0.0.1
+8.8.8.8
+8.8.4.4
+9.9.9.9
+149.112.112.112
+208.67.222.222
+208.67.220.220
+77.88.8.8
+77.88.8.1
+RESOLVERS
+
 if command -v resolvectl >/dev/null 2>&1; then
   resolvectl dns 2>/dev/null | tr ' ' '\n' | sed 's/%.*//' >>"$RAW" || true
 fi
 awk '$1 == "nameserver" {print $2}' /etc/resolv.conf 2>/dev/null >>"$RAW" || true
+collect_live_xray_dns >>"$RAW" || true
 if ! grep -Eq '[0-9A-Fa-f:.]' "$RAW"; then
   cat >>"$RAW" <<'RESOLVERS'
 1.1.1.1
@@ -2775,16 +2835,45 @@ fi
 "$PYTHON" - "$RAW" "$ALLOW_V4" "$ALLOW_V6" <<'PY'
 import ipaddress
 import sys
+from urllib.parse import urlsplit
 
 raw_path, v4_path, v6_path = sys.argv[1:4]
 v4 = []
 v6 = []
+
+def extract_ip(token):
+    token = token.strip()
+    if not token:
+        return None
+    if "://" in token:
+        try:
+            token = urlsplit(token).hostname or ""
+        except Exception:
+            return None
+    if not token:
+        return None
+    try:
+        return ipaddress.ip_address(token)
+    except ValueError:
+        pass
+    if token.startswith("[") and "]" in token:
+        candidate = token[1:token.index("]")]
+        try:
+            return ipaddress.ip_address(candidate)
+        except ValueError:
+            return None
+    if token.count(":") == 1 and token.rsplit(":", 1)[1].isdigit():
+        candidate = token.rsplit(":", 1)[0]
+        try:
+            return ipaddress.ip_address(candidate)
+        except ValueError:
+            return None
+    return None
+
 with open(raw_path, "r", encoding="utf-8", errors="ignore") as handle:
     for token in handle.read().replace(",", " ").split():
-        token = token.strip("[]")
-        try:
-            addr = ipaddress.ip_address(token)
-        except ValueError:
+        addr = extract_ip(token)
+        if addr is None:
             continue
         if addr.is_loopback:
             continue
@@ -3125,6 +3214,17 @@ EOF
   systemctl daemon-reload
 }
 
+ensure_nginx_hash_tuning() {
+  install -d -m 0755 /etc/nginx/conf.d
+  cat >/etc/nginx/conf.d/00-remnanode-hash-tuning.conf <<'EOF'
+# Managed by RemnaNode installer.
+# Protect the first nginx -t bootstrap pass on images where the default
+# server_names hash is too small for the loaded vhost set.
+server_names_hash_bucket_size 128;
+server_names_hash_max_size 4096;
+EOF
+}
+
 select_nginx_include_target() {
   local sites_probe="/etc/nginx/sites-enabled/zz-remnanode-include-probe-$$.conf"
   local confd_probe="/etc/nginx/conf.d/zz-remnanode-include-probe-$$.conf"
@@ -3343,6 +3443,7 @@ obtain_or_copy_certificate() {
   log "Получаю Let's Encrypt certificate для $XHTTP_DOMAIN"
   certbot certonly --webroot -w "$NGINX_ACME_ROOT" -d "$XHTTP_DOMAIN" \
     --cert-name "$XHTTP_DOMAIN" --non-interactive --agree-tos \
+    --key-type ecdsa --elliptic-curve secp256r1 \
     "${renewal_args[@]}" "${email_args[@]}"
   le_dir="/etc/letsencrypt/live/$XHTTP_DOMAIN"
   tls_pair_usable_for_domain "$le_dir/fullchain.pem" "$le_dir/privkey.pem" "$XHTTP_DOMAIN" || \
@@ -3603,6 +3704,7 @@ configure_xhttp_module() {
 
   log "Настраиваю optional xHTTP module без HTTP/3 и без подмен RemnaNode"
   check_xhttp_port_conflicts
+  ensure_nginx_hash_tuning
   apt_retry install -y --no-install-recommends nginx certbot
   acquire_nginx_lock
   select_nginx_include_target
@@ -3956,6 +4058,13 @@ start_xhttp_socket_guard() {
   systemctl start remnanode-xhttp-socket-guard.timer
   systemctl is-active --quiet remnanode-xhttp-socket-guard.timer || \
     die "Таймер безопасного восстановления xHTTP socket не запустился."
+}
+
+refresh_dns_reflection_guard_runtime() {
+  bool_true "$ENABLE_DNS_REFLECTION_GUARD" || return 0
+  unit_known_to_systemd remnanode-dns-reflection-guard.service || return 0
+  systemctl restart remnanode-dns-reflection-guard.service || \
+    die "DNS reflection guard не смог обновить allowlist после старта remnanode."
 }
 
 select_and_pull_image() {
@@ -4546,6 +4655,7 @@ run_install() {
   activate_node
   start_xhttp_socket_guard
   verify_node
+  refresh_dns_reflection_guard_runtime
   write_state
   restore_security_timers_if_legacy
   record_legacy_reboot_requirement
