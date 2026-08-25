@@ -10,7 +10,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
-INSTALLER_VERSION="3.1.0"
+INSTALLER_VERSION="3.1.1"
 DEFAULT_NODE_VERSION="2.8.0"
 PANEL_COMPAT_VERSION="2.8.1"
 
@@ -37,6 +37,8 @@ XHTTP_GUARD_SCRIPT="/usr/local/sbin/remnanode-xhttp-socket-guard.sh"
 XHTTP_GUARD_SERVICE="/etc/systemd/system/remnanode-xhttp-socket-guard.service"
 XHTTP_GUARD_TIMER="/etc/systemd/system/remnanode-xhttp-socket-guard.timer"
 XHTTP_GUARD_MARKER="/run/remnanode-xhttp-guard.last-restart"
+QUIC_RUNTIME_SCRIPT="/usr/local/sbin/remnanode-quic-runtime.sh"
+QUIC_RUNTIME_SERVICE="/etc/systemd/system/remnanode-quic-runtime.service"
 SPAMHAUS_EGRESS_GUARD_SCRIPT="/usr/local/sbin/remnanode-spamhaus-egress-guard.sh"
 SPAMHAUS_EGRESS_GUARD_SERVICE="/etc/systemd/system/remnanode-spamhaus-egress-guard.service"
 SPAMHAUS_EGRESS_GUARD_TIMER="/etc/systemd/system/remnanode-spamhaus-egress-guard.timer"
@@ -1355,6 +1357,7 @@ managed_units() {
 remnanode-maintenance.timer
 remnanode-xhttp-socket-guard.timer
 remnanode-xhttp-socket-guard.service
+remnanode-quic-runtime.service
 remnanode-firewall.service
 remnanode-spamhaus-egress-guard.timer
 remnanode-spamhaus-egress-guard.service
@@ -1386,6 +1389,7 @@ backup_system_paths() {
     "$NGINX_CONF_D_BOOTSTRAP" \
     "$CERT_DEPLOY_HOOK" "$NGINX_CAPACITY_DROPIN" "$MAINTENANCE_SCRIPT" "$MAINTENANCE_SERVICE" \
     "$MAINTENANCE_TIMER" "$XHTTP_GUARD_SCRIPT" "$XHTTP_GUARD_SERVICE" "$XHTTP_GUARD_TIMER" \
+    "$QUIC_RUNTIME_SCRIPT" "$QUIC_RUNTIME_SERVICE" \
     "$SPAMHAUS_EGRESS_GUARD_SCRIPT" "$SPAMHAUS_EGRESS_GUARD_SERVICE" "$SPAMHAUS_EGRESS_GUARD_TIMER" \
     "$OUTBOUND_SSH_GUARD_SCRIPT" "$OUTBOUND_SSH_GUARD_SERVICE" \
     "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" \
@@ -1424,6 +1428,7 @@ net.ipv4.tcp_mtu_probing
 net.ipv4.tcp_slow_start_after_idle
 net.ipv4.tcp_rmem
 net.ipv4.tcp_wmem
+net.ipv4.udp_mem
 net.ipv4.udp_rmem_min
 net.ipv4.udp_wmem_min
 net.netfilter.nf_conntrack_max
@@ -1579,10 +1584,79 @@ remove_known_current_files_for_rollback() {
     "$NGINX_CONF_D_BOOTSTRAP" \
     "$CERT_DEPLOY_HOOK" "$NGINX_CAPACITY_DROPIN" "$MAINTENANCE_SCRIPT" "$MAINTENANCE_SERVICE" \
     "$MAINTENANCE_TIMER" "$XHTTP_GUARD_SCRIPT" "$XHTTP_GUARD_SERVICE" "$XHTTP_GUARD_TIMER" \
+    "$QUIC_RUNTIME_SCRIPT" "$QUIC_RUNTIME_SERVICE" \
     "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER"
   while IFS= read -r path; do
     rm -f -- "$path"
   done < <(legacy_paths)
+}
+
+safe_positive_int() {
+  local value="${1:-0}"
+  [[ "$value" =~ ^[0-9]+$ ]] || value=0
+  printf '%s' "$value"
+}
+
+primary_uplink_iface() {
+  local iface=""
+  iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
+  if [[ -z "$iface" ]]; then
+    iface="$(ip -o link show up 2>/dev/null | awk -F': ' '$2 != "lo" {print $2; exit}')"
+  fi
+  printf '%s' "$iface"
+}
+
+iface_driver() {
+  local iface="$1"
+  [[ -n "$iface" ]] || return 0
+  ethtool -i "$iface" 2>/dev/null | awk -F': ' '/^driver:/ {print $2; exit}'
+}
+
+adaptive_udp_mem_triplet() {
+  local mem_mb=0
+  local hysteria_expected=0
+  mem_mb="$(safe_positive_int "${1:-0}")"
+  hysteria_expected="$(safe_positive_int "${2:-0}")"
+
+  if (( mem_mb >= 6144 )); then
+    printf '186252 248336 372504'
+  elif (( mem_mb >= 3072 )); then
+    if (( hysteria_expected == 1 )); then
+      printf '186252 248336 372504'
+    else
+      printf '131072 174762 262144'
+    fi
+  elif (( mem_mb >= 1536 )); then
+    printf '98304 131072 196608'
+  else
+    printf '65536 87380 131072'
+  fi
+}
+
+adaptive_quic_runtime_profile() {
+  local cpu_count=0
+  local mem_mb=0
+  local driver=""
+  local virtual_driver=0
+  cpu_count="$(safe_positive_int "${1:-0}")"
+  mem_mb="$(safe_positive_int "${2:-0}")"
+  driver="$(trim "${3:-}")"
+
+  case "$driver" in
+    virtio_net|vmxnet3|ena|gve)
+      virtual_driver=1
+      ;;
+  esac
+
+  if (( cpu_count <= 4 || mem_mb <= 6144 )); then
+    printf 'safe'
+    return 0
+  fi
+  if (( virtual_driver == 1 && cpu_count <= 8 && mem_mb <= 8192 )); then
+    printf 'safe'
+    return 0
+  fi
+  printf 'balanced'
 }
 
 remove_remnanode_container_gracefully() {
@@ -1720,6 +1794,7 @@ rollback_from_backup() {
   systemctl disable --now remnanode-maintenance.timer >/dev/null 2>&1 || true
   systemctl disable --now remnanode-xhttp-socket-guard.timer >/dev/null 2>&1 || true
   systemctl stop remnanode-xhttp-socket-guard.service >/dev/null 2>&1 || true
+  systemctl disable --now remnanode-quic-runtime.service >/dev/null 2>&1 || true
   rm -f -- "$XHTTP_GUARD_MARKER"
   systemctl disable remnanode-firewall.service >/dev/null 2>&1 || true
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -2092,24 +2167,41 @@ configure_minimal_sysctl() {
   local bbr_available=0
   local tmp=""
   local mem_mb=""
+  local cpu_count=1
+  local hysteria_expected=0
   local socket_max=8388608
   local netdev_backlog=4096
   local syn_backlog=4096
   local conntrack_target=131072
   local conntrack_current=0
+  local udp_mem_triplet=""
 
+  cpu_count="$(safe_positive_int "$(nproc --all 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')")"
   mem_mb="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)"
-  if (( mem_mb >= 4096 )); then
-    socket_max=33554432
+  bool_true "$EXPECT_HYSTERIA" && hysteria_expected=1
+  if (( mem_mb >= 6144 )); then
+    socket_max=67108864
     netdev_backlog=32768
     syn_backlog=16384
     conntrack_target=524288
+  elif (( mem_mb >= 3072 )); then
+    socket_max=33554432
+    (( hysteria_expected == 1 )) && socket_max=67108864
+    netdev_backlog=16384
+    syn_backlog=8192
+    conntrack_target=262144
   elif (( mem_mb >= 1536 )); then
     socket_max=16777216
+    (( hysteria_expected == 1 )) && socket_max=33554432
     netdev_backlog=16384
     syn_backlog=8192
     conntrack_target=262144
   fi
+  if (( cpu_count >= 8 && mem_mb >= 3072 )); then
+    (( netdev_backlog < 32768 )) && netdev_backlog=32768
+    (( syn_backlog < 16384 )) && syn_backlog=16384
+  fi
+  udp_mem_triplet="$(adaptive_udp_mem_triplet "$mem_mb" "$hysteria_expected")"
 
   tmp="$(mktemp)"
   {
@@ -2130,6 +2222,7 @@ configure_minimal_sysctl() {
     printf 'net.ipv4.tcp_slow_start_after_idle = 0\n'
     printf 'net.ipv4.tcp_rmem = 4096 131072 %s\n' "$socket_max"
     printf 'net.ipv4.tcp_wmem = 4096 65536 %s\n' "$socket_max"
+    printf 'net.ipv4.udp_mem = %s\n' "$udp_mem_triplet"
     printf 'net.ipv4.udp_rmem_min = 16384\n'
     printf 'net.ipv4.udp_wmem_min = 16384\n'
   } >"$tmp"
@@ -2163,7 +2256,143 @@ configure_minimal_sysctl() {
     [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" == "bbr" ]] || \
       warn "BBR доступен, но provider не разрешил сделать его активным."
   fi
-  log "Adaptive network baseline: RAM=${mem_mb}MiB, socket-max=$socket_max, backlog=$netdev_backlog"
+  log "Adaptive network baseline: CPU=${cpu_count}, RAM=${mem_mb}MiB, socket-max=$socket_max, udp-mem=[$udp_mem_triplet], backlog=$netdev_backlog"
+}
+
+configure_quic_runtime_tuning() {
+  local expect_hysteria_flag=0
+  local enable_bbr_flag=0
+  local iface=""
+  local driver="unknown"
+  local cpu_count=1
+  local mem_mb=0
+  local profile="balanced"
+
+  bool_true "$EXPECT_HYSTERIA" && expect_hysteria_flag=1
+  bool_true "$ENABLE_BBR" && enable_bbr_flag=1
+  iface="$(primary_uplink_iface)"
+  driver="$(iface_driver "$iface")"
+  [[ -n "$driver" ]] || driver="unknown"
+  cpu_count="$(safe_positive_int "$(nproc --all 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')")"
+  mem_mb="$(safe_positive_int "$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || printf '0')")"
+  profile="$(adaptive_quic_runtime_profile "$cpu_count" "$mem_mb" "$driver")"
+
+  install -d -m 0755 "$(dirname "$QUIC_RUNTIME_SCRIPT")" "$(dirname "$QUIC_RUNTIME_SERVICE")"
+  cat >"$QUIC_RUNTIME_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENABLE_BBR=${enable_bbr_flag}
+EXPECT_HYSTERIA=${expect_hysteria_flag}
+
+safe_positive_int() {
+  local value="\${1:-0}"
+  [[ "\$value" =~ ^[0-9]+$ ]] || value=0
+  printf '%s' "\$value"
+}
+
+primary_uplink_iface() {
+  local iface=""
+  iface="\$(ip route show default 2>/dev/null | awk '/default/ {print \$5; exit}')"
+  if [[ -z "\$iface" ]]; then
+    iface="\$(ip -o link show up 2>/dev/null | awk -F': ' '\$2 != \"lo\" {print \$2; exit}')"
+  fi
+  printf '%s' "\$iface"
+}
+
+iface_driver() {
+  local iface="\$1"
+  [[ -n "\$iface" ]] || return 0
+  ethtool -i "\$iface" 2>/dev/null | awk -F': ' '/^driver:/ {print \$2; exit}'
+}
+
+adaptive_quic_runtime_profile() {
+  local cpu_count=0
+  local mem_mb=0
+  local driver=""
+  local virtual_driver=0
+  cpu_count="\$(safe_positive_int "\${1:-0}")"
+  mem_mb="\$(safe_positive_int "\${2:-0}")"
+  driver="\${3:-}"
+  case "\$driver" in
+    virtio_net|vmxnet3|ena|gve)
+      virtual_driver=1
+      ;;
+  esac
+  if (( cpu_count <= 4 || mem_mb <= 6144 )); then
+    printf 'safe'
+    return 0
+  fi
+  if (( virtual_driver == 1 && cpu_count <= 8 && mem_mb <= 8192 )); then
+    printf 'safe'
+    return 0
+  fi
+  printf 'balanced'
+}
+
+main() {
+  local iface=""
+  local driver="unknown"
+  local cpu_count=1
+  local mem_mb=0
+  local profile="balanced"
+
+  iface="\$(primary_uplink_iface)"
+  [[ -n "\$iface" ]] || exit 0
+  driver="\$(iface_driver "\$iface")"
+  [[ -n "\$driver" ]] || driver="unknown"
+  cpu_count="\$(safe_positive_int "\$(nproc --all 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')")"
+  mem_mb="\$(safe_positive_int "\$(awk '/MemTotal/ {print int(\$2/1024)}' /proc/meminfo 2>/dev/null || printf '0')")"
+  profile="\$(adaptive_quic_runtime_profile "\$cpu_count" "\$mem_mb" "\$driver")"
+
+  if (( ENABLE_BBR == 1 )) && command -v tc >/dev/null 2>&1; then
+    tc qdisc replace dev "\$iface" root fq >/dev/null 2>&1 || true
+  fi
+
+  if (( EXPECT_HYSTERIA == 1 )) && command -v ethtool >/dev/null 2>&1; then
+    ethtool -K "\$iface" tx-udp-segmentation off >/dev/null 2>&1 || true
+    ethtool -K "\$iface" rx-gro-hw off >/dev/null 2>&1 || true
+    ethtool -K "\$iface" rx-udp-gro-forwarding off >/dev/null 2>&1 || true
+    if [[ "\$profile" == "safe" ]]; then
+      ethtool -K "\$iface" gro off >/dev/null 2>&1 || true
+      ethtool -K "\$iface" gso off >/dev/null 2>&1 || true
+      ethtool -K "\$iface" tso off >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if command -v logger >/dev/null 2>&1; then
+    logger -t remnanode-quic-runtime -- "iface=\$iface driver=\$driver cpu=\$cpu_count mem=\${mem_mb}MiB profile=\$profile hysteria=\$EXPECT_HYSTERIA bbr=\$ENABLE_BBR"
+  fi
+}
+
+main "\$@"
+EOF
+  chmod 0755 "$QUIC_RUNTIME_SCRIPT"
+
+  cat >"$QUIC_RUNTIME_SERVICE" <<EOF
+[Unit]
+Description=Adaptive QUIC/Hysteria runtime tuning for RemnaNode
+After=network-online.target
+Wants=network-online.target
+Before=docker.service
+ConditionPathExists=/sys/class/net
+
+[Service]
+Type=oneshot
+ExecStart=$QUIC_RUNTIME_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 "$QUIC_RUNTIME_SERVICE"
+
+  systemctl daemon-reload >/dev/null
+  systemctl enable remnanode-quic-runtime.service >/dev/null || \
+    die "Не удалось включить remnanode-quic-runtime.service."
+  systemctl restart remnanode-quic-runtime.service >/dev/null || \
+    die "Не удалось применить adaptive QUIC/Hysteria runtime tuning."
+  log "Adaptive QUIC runtime: iface=${iface:-auto}, driver=${driver}, CPU=${cpu_count}, RAM=${mem_mb}MiB, profile=${profile}"
 }
 
 write_logrotate() {
@@ -4513,6 +4742,7 @@ show_status() {
   local firewall="inactive"
   local maintenance="inactive"
   local xhttp_guard="inactive"
+  local quic_runtime="inactive"
   local spamhaus_guard="inactive"
   local outbound_ssh_guard="inactive"
   local dns_reflection_guard="inactive"
@@ -4548,6 +4778,7 @@ PY
   nft list table inet remnanode_installer >/dev/null 2>&1 && firewall="active"
   systemctl is-active --quiet remnanode-maintenance.timer 2>/dev/null && maintenance="active"
   systemctl is-active --quiet remnanode-xhttp-socket-guard.timer 2>/dev/null && xhttp_guard="active"
+  systemctl is-active --quiet remnanode-quic-runtime.service 2>/dev/null && quic_runtime="active"
   if nft list table inet remnanode_spamhaus_egress_guard >/dev/null 2>&1; then
     spamhaus_guard="active"
   elif systemctl is-active --quiet remnanode-spamhaus-egress-guard.timer 2>/dev/null; then
@@ -4573,6 +4804,7 @@ PY
   printf 'DNS egress:      %s\n' "$dns_reflection_guard"
   printf 'BitTorrent:      %s\n' "$bittorrent_guard"
   printf 'Maintenance:     %s\n' "$maintenance"
+  printf 'QUIC runtime:    %s\n' "$quic_runtime"
   printf 'xHTTP recovery:  %s\n' "$xhttp_guard"
   if legacy_reboot_required; then
     printf 'Legacy reboot:   required (one planned reboot)\n'
@@ -4643,6 +4875,7 @@ run_install() {
   cleanup_legacy_files
   configure_small_swap
   configure_minimal_sysctl
+  configure_quic_runtime_tuning
   write_logrotate
   configure_log_hygiene_and_maintenance
   write_firewall
