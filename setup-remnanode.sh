@@ -10,7 +10,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
-INSTALLER_VERSION="3.1.1"
+INSTALLER_VERSION="3.1.2"
 DEFAULT_NODE_VERSION="2.8.0"
 PANEL_COMPAT_VERSION="2.8.1"
 
@@ -2981,6 +2981,8 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 NFT="$(command -v nft || true)"
 PYTHON="$(command -v python3 || true)"
+SYSTEMCTL="$(command -v systemctl || true)"
+TIMEOUT="$(command -v timeout || true)"
 [[ -n "$NFT" ]] || { echo "nft is required" >&2; exit 1; }
 [[ -n "$PYTHON" ]] || { echo "python3 is required" >&2; exit 1; }
 
@@ -3001,10 +3003,14 @@ collect_live_xray_dns() {
   local token=""
   command -v docker >/dev/null 2>&1 || return 0
   command -v nsenter >/dev/null 2>&1 || return 0
-  docker inspect remnanode >/dev/null 2>&1 || return 0
-  pid="$(docker inspect -f '{{.State.Pid}}' remnanode 2>/dev/null || true)"
+  [[ -n "$SYSTEMCTL" && -n "$TIMEOUT" ]] || return 0
+  # This unit runs Before=docker.service. Never contact Docker's socket while
+  # the daemon is inactive, otherwise systemd creates a boot-time deadlock.
+  "$SYSTEMCTL" is-active --quiet docker.service || return 0
+  "$TIMEOUT" 5 docker inspect remnanode >/dev/null 2>&1 || return 0
+  pid="$("$TIMEOUT" 5 docker inspect -f '{{.State.Pid}}' remnanode 2>/dev/null || true)"
   [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || return 0
-  line="$(docker top remnanode -eo pid,args 2>/dev/null | awk '/\/usr\/local\/bin\/rw-core/ {print; exit}')"
+  line="$("$TIMEOUT" 5 docker top remnanode -eo pid,args 2>/dev/null | awk '/\/usr\/local\/bin\/rw-core/ {print; exit}')"
   [[ -n "$line" ]] || return 0
   sock="$(printf '%s\n' "$line" | sed -n 's/.*-config @\([^:]*\):\/internal\/get-config.*/\1/p')"
   token="$(printf '%s\n' "$line" | sed -n 's/.*token=\([A-Za-z0-9]*\).*/\1/p')"
@@ -3205,6 +3211,7 @@ Before=docker.service
 [Service]
 Type=oneshot
 ExecStart=$DNS_REFLECTION_GUARD_SCRIPT
+TimeoutStartSec=30s
 RemainAfterExit=yes
 
 [Install]
