@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# RemnaNode production installer for Remnawave Panel 2.8.x.
+# RemnaNode installer for the Remnawave 3.x generation (Node 3.4.1).
+# Reference: https://github.com/remnawave/node/releases/tag/3.4.1
+# Reference: https://docs.rw/install/remnawave-node/
 # Supported hosts: Ubuntu/Debian, systemd, linux/amd64 or linux/arm64.
 # The installer deliberately does not patch files inside the RemnaNode image.
 
 umask 027
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export DEBIAN_FRONTEND=noninteractive
-export NEEDRESTART_MODE=a
+# Do not restart unrelated production services during dependency installation.
+export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="3.1.2"
-DEFAULT_NODE_VERSION="2.8.0"
-PANEL_COMPAT_VERSION="2.8.1"
+INSTALLER_VERSION="4.0.0"
+INSTALLER_MAIN_BASHPID="$BASHPID"
+DEFAULT_NODE_VERSION="3.4.1"
+PANEL_COMPAT_VERSION="3.4.x (panel must already be upgraded)"
+MIN_XRAY_VERSION="26.7.28"
 
 NODE_ROOT="/opt/remnanode"
 COMPOSE_FILE="$NODE_ROOT/docker-compose.yml"
@@ -87,6 +92,7 @@ ENABLE_OUTBOUND_SSH_GUARD_EXPLICIT="${ENABLE_OUTBOUND_SSH_GUARD+x}"
 ENABLE_DNS_REFLECTION_GUARD_EXPLICIT="${ENABLE_DNS_REFLECTION_GUARD+x}"
 ENABLE_BITTORRENT_GUARD_EXPLICIT="${ENABLE_BITTORRENT_GUARD+x}"
 ENABLE_BBR_EXPLICIT="${ENABLE_BBR+x}"
+ENABLE_QUIC_TUNING_EXPLICIT="${ENABLE_QUIC_TUNING+x}"
 AUTO_SWAP_EXPLICIT="${AUTO_SWAP+x}"
 ENABLE_MAINTENANCE_EXPLICIT="${ENABLE_MAINTENANCE+x}"
 BACKUP_RETENTION_EXPLICIT="${BACKUP_RETENTION+x}"
@@ -111,16 +117,19 @@ TLS_CERT_FILE="${TLS_CERT_FILE:-}"
 TLS_KEY_FILE="${TLS_KEY_FILE:-}"
 
 MANAGE_FIREWALL="${MANAGE_FIREWALL:-1}"
-PUBLIC_TCP_PORTS="${PUBLIC_TCP_PORTS:-443}"
-PUBLIC_UDP_PORTS="${PUBLIC_UDP_PORTS:-443}"
+PUBLIC_TCP_PORTS="${PUBLIC_TCP_PORTS-443}"
+PUBLIC_UDP_PORTS="${PUBLIC_UDP_PORTS-443}"
 BLOCK_SMTP_EGRESS="${BLOCK_SMTP_EGRESS:-1}"
 BLOCK_SMTP_FORWARD="${BLOCK_SMTP_FORWARD:-1}"
 SMTP_EGRESS_PORTS="${SMTP_EGRESS_PORTS:-25,465,587,2525}"
-ENABLE_SPAMHAUS_EGRESS_GUARD="${ENABLE_SPAMHAUS_EGRESS_GUARD:-1}"
-ENABLE_OUTBOUND_SSH_GUARD="${ENABLE_OUTBOUND_SSH_GUARD:-1}"
-ENABLE_DNS_REFLECTION_GUARD="${ENABLE_DNS_REFLECTION_GUARD:-1}"
-ENABLE_BITTORRENT_GUARD="${ENABLE_BITTORRENT_GUARD:-1}"
+# HOST-WIDE policies, not native per-profile Node plugins. Opt in on fresh
+# installations; updates retain the previously saved choices.
+ENABLE_SPAMHAUS_EGRESS_GUARD="${ENABLE_SPAMHAUS_EGRESS_GUARD:-0}"
+ENABLE_OUTBOUND_SSH_GUARD="${ENABLE_OUTBOUND_SSH_GUARD:-0}"
+ENABLE_DNS_REFLECTION_GUARD="${ENABLE_DNS_REFLECTION_GUARD:-0}"
+ENABLE_BITTORRENT_GUARD="${ENABLE_BITTORRENT_GUARD:-0}"
 ENABLE_BBR="${ENABLE_BBR:-1}"
+ENABLE_QUIC_TUNING="${ENABLE_QUIC_TUNING:-0}"
 AUTO_SWAP="${AUTO_SWAP:-1}"
 ENABLE_MAINTENANCE="${ENABLE_MAINTENANCE:-1}"
 BACKUP_RETENTION="${BACKUP_RETENTION:-5}"
@@ -129,7 +138,7 @@ JOURNAL_RETENTION="${JOURNAL_RETENTION:-14day}"
 REQUIRE_NODE_PLUGINS="${REQUIRE_NODE_PLUGINS:-1}"
 VERIFY_PROFILE_TRANSPORTS="${VERIFY_PROFILE_TRANSPORTS:-1}"
 REQUIRE_PROFILE_READY="${REQUIRE_PROFILE_READY:-0}"
-EXPECT_HYSTERIA="${EXPECT_HYSTERIA:-1}"
+EXPECT_HYSTERIA="${EXPECT_HYSTERIA:-0}"
 HYSTERIA_PORT="${HYSTERIA_PORT:-443}"
 PROFILE_WAIT_SECONDS="${PROFILE_WAIT_SECONDS:-30}"
 ALLOW_OLD_KERNEL="${ALLOW_OLD_KERNEL:-0}"
@@ -144,6 +153,7 @@ PANEL_IPS=""
 XHTTP_DOMAIN=""
 SECRET_VALUE=""
 SELECTED_IMAGE=""
+SELECTED_IMAGE_ID=""
 STAGE_DIR=""
 SECRET_CHECK_DIR=""
 ROLLBACK_STAGE_DIR=""
@@ -162,6 +172,7 @@ TLS_MIN_VALID_SECONDS=604800
 NGINX_RESTART_REQUIRED=0
 NGINX_LOCK_FD=""
 APT_LAST_LOG=""
+PROFILE_VERIFIED=0
 
 log() {
   printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
@@ -270,7 +281,7 @@ collect_apt_repo_hosts() {
 
   result="$(trim "$result")"
   [[ -n "$result" ]] || result="archive.ubuntu.com security.ubuntu.com deb.debian.org"
-  printf '%s\n' $result
+  printf '%s\n' "$result" | tr ' ' '\n'
 }
 
 host_resolves_via_glibc() {
@@ -326,46 +337,58 @@ prepare_package_network() {
 ask() {
   local prompt="$1"
   local value=""
-  if [[ -r /dev/tty ]]; then
-    read -r -p "$prompt" value </dev/tty || return 1
+  local tty_fd="" rc=0
+  # /dev/tty may exist but be unopenable in cloud-init or a detached session.
+  if { exec {tty_fd}</dev/tty; } 2>/dev/null; then
+    read -r -p "$prompt" value <&"$tty_fd" || rc=$?
+    exec {tty_fd}<&-
   else
-    read -r -p "$prompt" value || return 1
+    read -r -p "$prompt" value || rc=$?
   fi
+  (( rc == 0 )) || return "$rc"
   printf '%s' "$value"
 }
 
 ask_secret() {
   local value=""
-  if [[ -r /dev/tty ]]; then
-    read -r -p "SECRET_KEY из карточки ноды (ввод отображается): " value </dev/tty || return 1
+  local tty_fd="" rc=0
+  if { exec {tty_fd}</dev/tty; } 2>/dev/null; then
+    read -r -p "SECRET_KEY из карточки ноды (ввод отображается): " value <&"$tty_fd" || rc=$?
+    exec {tty_fd}<&-
   else
-    read -r -p "SECRET_KEY из карточки ноды (ввод отображается): " value || return 1
+    read -r -p "SECRET_KEY из карточки ноды (ввод отображается): " value || rc=$?
   fi
+  (( rc == 0 )) || return "$rc"
   printf '%s' "$value"
 }
 
 usage() {
   cat <<'EOF'
-RemnaNode installer 3.x for Panel 2.8.x / Node 2.8.0
+RemnaNode installer 4.0.0 for Panel 3.4.x / Node 3.4.1
 
 Usage:
-  setup-remnanode.sh [install|update|repair|status|rollback] [options]
+  setup-remnanode.sh [install|update|repair|status|logs|xray-logs|rollback] [options]
 
 Options:
   --panel-ip IP             IP/CIDR мастер-панели; можно повторять
   --panel-ips "LIST"        IPv4/IPv6/CIDR через запятую или пробел
   --node-port PORT          Control API port, default: 2222
-  --node-version VERSION    Pinned Node version, default: 2.8.0
+  --node-version VERSION    Pinned stable Node 3.x version, default: 3.4.1
   --image IMAGE             Official image override
   --xhttp-domain DOMAIN     Настроить Nginx/TLS для xHTTP
   --xhttp-path PATH         Default: /stable-in-443/
   --xhttp-socket PATH       Default: /dev/shm/xrxh-stable.socket
   --no-xhttp                Удалить legacy xHTTP-конфиг этого installer
   --no-hysteria             Не требовать и не проверять Hysteria/UDP
+  --hysteria                Проверять Hysteria/UDP (на новой ноде выключено)
+  --require-profile-ready   При неготовом профиле считать установку неуспешной
+  --quic-tuning             Opt-in изменение offload/qdisc сетевого интерфейса
+  --no-quic-tuning          Не применять offload/qdisc (по умолчанию)
+  --antiabuse-guards        Включить все дополнительные HOST-WIDE блокировки
   --no-firewall             Отключить весь firewall installer (control + SMTP guard)
   --allow-smtp              Не блокировать исходящие SMTP-порты
   --block-smtp-forward      Также блокировать SMTP в FORWARD (по умолчанию включено)
-  --no-spamhaus-guard       Не ставить Spamhaus DROP/EDROP egress guard
+  --no-spamhaus-guard       Не ставить Spamhaus DROP egress guard
   --no-outbound-ssh-guard   Не блокировать исходящий/forwarded TCP/22
   --no-dns-reflection-guard Не блокировать публичный DNS egress/forward
   --no-bittorrent-guard     Не ставить BitTorrent copyright-abuse guard
@@ -386,8 +409,18 @@ Secrets:
   Передайте SECRET_FILE=/root/node-secret.txt или вставьте SECRET_KEY в
   интерактивном запросе с видимым вводом. Не передавайте secret аргументом процесса.
 
-Compatible one-line command:
-  curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | sudo env PANEL_IP=144.31.1.170 bash
+Examples (run on the NODE, not the master-panel):
+  sudo bash setup-remnanode.sh install --panel-ip 144.31.1.170
+  sudo bash setup-remnanode.sh update --dry-run
+  sudo bash setup-remnanode.sh update --yes
+  sudo bash setup-remnanode.sh status
+  sudo bash setup-remnanode.sh logs       # Node logs, Ctrl-C to stop following
+  sudo bash setup-remnanode.sh xray-logs  # Xray s6 log, Ctrl-C to stop following
+
+Update/repair target the version built into this installer, not an old saved tag.
+The installer does not upgrade the master panel, bots or third-party keys.
+Backups contain secrets: keep /var/backups/remnanode private (root only).
+Rollback restores managed configuration/image; it does not downgrade OS packages.
 EOF
 }
 
@@ -400,7 +433,7 @@ parse_args() {
 
   if [[ $# -gt 0 ]]; then
     case "$1" in
-      install|update|repair|status|rollback)
+      install|update|repair|status|logs|xray-logs|rollback)
         MODE="$1"
         shift
         ;;
@@ -465,6 +498,31 @@ parse_args() {
       --no-hysteria)
         EXPECT_HYSTERIA=0
         EXPECT_HYSTERIA_EXPLICIT=1
+        shift
+        ;;
+      --hysteria)
+        EXPECT_HYSTERIA=1
+        EXPECT_HYSTERIA_EXPLICIT=1
+        shift
+        ;;
+      --require-profile-ready)
+        REQUIRE_PROFILE_READY=1
+        shift
+        ;;
+      --quic-tuning|--no-quic-tuning)
+        [[ "$1" == "--quic-tuning" ]] && ENABLE_QUIC_TUNING=1 || ENABLE_QUIC_TUNING=0
+        ENABLE_QUIC_TUNING_EXPLICIT=1
+        shift
+        ;;
+      --antiabuse-guards)
+        ENABLE_SPAMHAUS_EGRESS_GUARD=1
+        ENABLE_OUTBOUND_SSH_GUARD=1
+        ENABLE_DNS_REFLECTION_GUARD=1
+        ENABLE_BITTORRENT_GUARD=1
+        ENABLE_SPAMHAUS_EGRESS_GUARD_EXPLICIT=1
+        ENABLE_OUTBOUND_SSH_GUARD_EXPLICIT=1
+        ENABLE_DNS_REFLECTION_GUARD_EXPLICIT=1
+        ENABLE_BITTORRENT_GUARD_EXPLICIT=1
         shift
         ;;
       --no-firewall)
@@ -642,9 +700,11 @@ validate_ipv4_cidr_basic() {
     (( 10#$part >= 0 && 10#$part <= 255 )) || return 1
   done
   if [[ -n "$prefix" ]]; then
-    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
-    (( prefix >= 0 && prefix <= 32 )) || return 1
+    [[ "$prefix" =~ ^(0|[1-9][0-9]{0,1})$ ]] || return 1
+    (( 10#$prefix >= 1 && 10#$prefix <= 32 )) || return 1
   fi
+  [[ "$value" != */ ]] || return 1
+  return 0
 }
 
 validate_ipv6_cidr_basic() {
@@ -654,9 +714,11 @@ validate_ipv6_cidr_basic() {
   [[ "$value" == */* ]] && prefix="${value##*/}"
   [[ "$ip" == *:* && "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
   if [[ -n "$prefix" ]]; then
-    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
-    (( prefix >= 0 && prefix <= 128 )) || return 1
+    [[ "$prefix" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+    (( 10#$prefix >= 1 && 10#$prefix <= 128 )) || return 1
   fi
+  [[ "$value" != */ ]] || return 1
+  return 0
 }
 
 validate_panel_ips_basic() {
@@ -678,7 +740,9 @@ for line in sys.stdin:
     if not value:
         continue
     try:
-        ipaddress.ip_network(value, strict=False)
+        network = ipaddress.ip_network(value, strict=False)
+        if network.prefixlen == 0 or network.network_address.is_unspecified or network.is_multicast:
+            raise ValueError("use specific panel addresses, not an open or multicast allowlist")
     except ValueError as exc:
         raise SystemExit(f"invalid panel IP/CIDR {value}: {exc}")
 ' || die "Строгая проверка PANEL_IPS не пройдена."
@@ -696,10 +760,17 @@ normalize_domain() {
 
 validate_domain() {
   local domain="$1"
+  local label=""
+  local -a labels=()
   [[ ${#domain} -le 253 ]] || return 1
   [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || return 1
   [[ "$domain" == *.* ]] || return 1
   [[ "$domain" != *..* ]] || return 1
+  IFS='.' read -r -a labels <<<"$domain"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -le 63 && "$label" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+  done
+  return 0
 }
 
 normalize_xhttp_path() {
@@ -724,16 +795,16 @@ validate_ports_csv() {
   local last=""
   local -a items=()
   [[ -z "$list" ]] && return 0
-  [[ "$list" =~ ^[0-9,-]+$ ]] || return 1
+  [[ "$list" =~ ^[0-9,-]+$ && "$list" != ,* && "$list" != *, && "$list" != *,,* ]] || return 1
   IFS=',' read -r -a items <<<"$list"
   for item in "${items[@]}"; do
     if [[ "$item" == *-* ]]; then
       first="${item%-*}"
       last="${item#*-}"
-      [[ "$first" =~ ^[0-9]+$ && "$last" =~ ^[0-9]+$ ]] || return 1
+      [[ "$first" =~ ^[1-9][0-9]{0,4}$ && "$last" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
       (( 10#$first >= 1 && 10#$first <= 10#$last && 10#$last <= 65535 )) || return 1
     else
-      [[ "$item" =~ ^[0-9]+$ ]] || return 1
+      [[ "$item" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
       (( 10#$item >= 1 && 10#$item <= 65535 )) || return 1
     fi
   done
@@ -766,17 +837,21 @@ validate_settings() {
   for setting in YES DRY_RUN ENABLE_XHTTP MANAGE_FIREWALL BLOCK_SMTP_EGRESS \
     BLOCK_SMTP_FORWARD ENABLE_SPAMHAUS_EGRESS_GUARD ENABLE_OUTBOUND_SSH_GUARD \
     ENABLE_DNS_REFLECTION_GUARD ENABLE_BITTORRENT_GUARD ENABLE_BBR AUTO_SWAP \
-    ENABLE_MAINTENANCE REQUIRE_NODE_PLUGINS \
+    ENABLE_MAINTENANCE ENABLE_QUIC_TUNING REQUIRE_NODE_PLUGINS \
     VERIFY_PROFILE_TRANSPORTS REQUIRE_PROFILE_READY EXPECT_HYSTERIA ALLOW_OLD_KERNEL \
     ALLOW_LOW_MEMORY ALLOW_NO_NET_ADMIN ALLOW_CUSTOM_IMAGE RUN_SYSTEM_UPGRADE; do
     bool_valid "${!setting}" || die "$setting должен быть boolean (0/1, true/false, yes/no)."
   done
-  [[ "$NODE_PORT" =~ ^[0-9]+$ ]] || die "NODE_PORT должен быть числом."
+  [[ "$NODE_PORT" =~ ^[0-9]{1,5}$ ]] || die "NODE_PORT должен быть числом (до 5 цифр)."
   NODE_PORT=$((10#$NODE_PORT))
   (( NODE_PORT >= 1024 && NODE_PORT <= 65535 )) || die "NODE_PORT должен быть 1024..65535."
-  [[ "$NODE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || \
-    die "Некорректный NODE_VERSION."
-  [[ "$STABILITY_SECONDS" =~ ^[0-9]+$ ]] || die "STABILITY_SECONDS должен быть числом."
+  if [[ ! "$NODE_VERSION" =~ ^3\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || ! version_ge "$NODE_VERSION" "$DEFAULT_NODE_VERSION"; then
+    die "Нужна стабильная версия Node 3.x не ниже $DEFAULT_NODE_VERSION. Для возврата используйте rollback."
+  fi
+  if bool_true "$REQUIRE_PROFILE_READY" && ! bool_true "$VERIFY_PROFILE_TRANSPORTS"; then
+    die "REQUIRE_PROFILE_READY требует VERIFY_PROFILE_TRANSPORTS=1."
+  fi
+  [[ "$STABILITY_SECONDS" =~ ^[0-9]{1,3}$ ]] || die "STABILITY_SECONDS должен быть числом."
   STABILITY_SECONDS=$((10#$STABILITY_SECONDS))
   (( STABILITY_SECONDS >= 10 && STABILITY_SECONDS <= 600 )) || \
     die "STABILITY_SECONDS должен быть 10..600."
@@ -787,7 +862,7 @@ validate_settings() {
      [[ -z "$SMTP_EGRESS_PORTS" ]]; then
     die "При BLOCK_SMTP_EGRESS=1 список SMTP_EGRESS_PORTS не может быть пустым."
   fi
-  [[ "$HYSTERIA_PORT" =~ ^[0-9]+$ ]] || die "HYSTERIA_PORT должен быть числом."
+  [[ "$HYSTERIA_PORT" =~ ^[0-9]{1,5}$ ]] || die "HYSTERIA_PORT должен быть числом."
   HYSTERIA_PORT=$((10#$HYSTERIA_PORT))
   (( HYSTERIA_PORT >= 1 && HYSTERIA_PORT <= 65535 )) || die "HYSTERIA_PORT должен быть 1..65535."
   if bool_true "$EXPECT_HYSTERIA" && ! port_in_csv "$HYSTERIA_PORT" "$PUBLIC_UDP_PORTS"; then
@@ -797,11 +872,11 @@ validate_settings() {
       PUBLIC_UDP_PORTS="$HYSTERIA_PORT"
     fi
   fi
-  [[ "$PROFILE_WAIT_SECONDS" =~ ^[0-9]+$ ]] || die "PROFILE_WAIT_SECONDS должен быть числом."
+  [[ "$PROFILE_WAIT_SECONDS" =~ ^[0-9]{1,3}$ ]] || die "PROFILE_WAIT_SECONDS должен быть числом."
   PROFILE_WAIT_SECONDS=$((10#$PROFILE_WAIT_SECONDS))
   (( PROFILE_WAIT_SECONDS >= 0 && PROFILE_WAIT_SECONDS <= 300 )) || \
     die "PROFILE_WAIT_SECONDS должен быть 0..300."
-  [[ "$BACKUP_RETENTION" =~ ^[0-9]+$ ]] || die "BACKUP_RETENTION должен быть числом."
+  [[ "$BACKUP_RETENTION" =~ ^[0-9]{1,2}$ ]] || die "BACKUP_RETENTION должен быть числом."
   BACKUP_RETENTION=$((10#$BACKUP_RETENTION))
   (( BACKUP_RETENTION >= 2 && BACKUP_RETENTION <= 50 )) || \
     die "BACKUP_RETENTION должен быть 2..50."
@@ -812,9 +887,24 @@ validate_settings() {
     die "NODE_PORT $NODE_PORT нельзя включать в PUBLIC_TCP_PORTS: control API должен быть доступен только панели."
   fi
 
-  if [[ -n "$NODE_IMAGE_INPUT" ]] && ! bool_true "$ALLOW_CUSTOM_IMAGE"; then
-    [[ "$NODE_IMAGE_INPUT" == "ghcr.io/remnawave/node:"* || "$NODE_IMAGE_INPUT" == "remnawave/node:"* ]] || \
-      die "Разрешены только официальные образы Remnawave. Для своего image задайте ALLOW_CUSTOM_IMAGE=1."
+  [[ "$APT_LOCK_TIMEOUT" =~ ^[0-9]{1,4}$ ]] || die "APT_LOCK_TIMEOUT должен быть числом (секунды)."
+  if [[ -n "$NODE_IMAGE_INPUT" ]]; then
+    [[ "$NODE_IMAGE_INPUT" =~ ^[a-zA-Z0-9][a-zA-Z0-9./_:@-]*$ ]] || die "Некорректное имя Docker image."
+    if ! bool_true "$ALLOW_CUSTOM_IMAGE"; then
+      [[ "$NODE_IMAGE_INPUT" == "ghcr.io/remnawave/node:$NODE_VERSION" || "$NODE_IMAGE_INPUT" == "remnawave/node:$NODE_VERSION" ]] || \
+        die "--image должен быть официальным image с точным тегом $NODE_VERSION. Latest и несовпадающие версии запрещены."
+    fi
+  fi
+}
+
+require_trusted_root_file() {
+  local file="$1"
+  local owner="" mode=""
+  [[ -f "$file" && ! -L "$file" ]] || die "Ожидался обычный root-owned файл: $file"
+  owner="$(stat -c %u "$file")"
+  mode="$(stat -c %a "$file")"
+  if [[ "$owner" != 0 || ! "$mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$mode & 0022) != 0 )); then
+    die "Небезопасные owner/permissions: $file (нужен root и запрет записи group/other)."
   fi
 }
 
@@ -827,6 +917,7 @@ load_saved_state() {
     state_source="$INSTALLER_CONFIG"
   fi
   if [[ -n "$state_source" ]]; then
+    require_trusted_root_file "$state_source"
     # shellcheck disable=SC1090
     source "$state_source"
   fi
@@ -838,8 +929,8 @@ load_saved_state() {
   [[ -n "$XHTTP_PATH_EXPLICIT" || -z "${SAVED_XHTTP_PATH:-}" ]] || XHTTP_PATH="$SAVED_XHTTP_PATH"
   [[ -n "$XHTTP_SOCKET_EXPLICIT" || -z "${SAVED_XHTTP_SOCKET:-}" ]] || XHTTP_SOCKET="$SAVED_XHTTP_SOCKET"
   [[ -n "$MANAGE_FIREWALL_EXPLICIT" || -z "${SAVED_MANAGE_FIREWALL:-}" ]] || MANAGE_FIREWALL="$SAVED_MANAGE_FIREWALL"
-  [[ -n "$PUBLIC_TCP_PORTS_EXPLICIT" || -z "${SAVED_PUBLIC_TCP_PORTS:-}" ]] || PUBLIC_TCP_PORTS="$SAVED_PUBLIC_TCP_PORTS"
-  [[ -n "$PUBLIC_UDP_PORTS_EXPLICIT" || -z "${SAVED_PUBLIC_UDP_PORTS:-}" ]] || PUBLIC_UDP_PORTS="$SAVED_PUBLIC_UDP_PORTS"
+  [[ -n "$PUBLIC_TCP_PORTS_EXPLICIT" || -z "${SAVED_PUBLIC_TCP_PORTS+x}" ]] || PUBLIC_TCP_PORTS="$SAVED_PUBLIC_TCP_PORTS"
+  [[ -n "$PUBLIC_UDP_PORTS_EXPLICIT" || -z "${SAVED_PUBLIC_UDP_PORTS+x}" ]] || PUBLIC_UDP_PORTS="$SAVED_PUBLIC_UDP_PORTS"
   [[ -n "$BLOCK_SMTP_EGRESS_EXPLICIT" || -z "${SAVED_BLOCK_SMTP_EGRESS:-}" ]] || BLOCK_SMTP_EGRESS="$SAVED_BLOCK_SMTP_EGRESS"
   [[ -n "$BLOCK_SMTP_FORWARD_EXPLICIT" || -z "${SAVED_BLOCK_SMTP_FORWARD:-}" ]] || BLOCK_SMTP_FORWARD="$SAVED_BLOCK_SMTP_FORWARD"
   [[ -n "$SMTP_EGRESS_PORTS_EXPLICIT" || -z "${SAVED_SMTP_EGRESS_PORTS:-}" ]] || SMTP_EGRESS_PORTS="$SAVED_SMTP_EGRESS_PORTS"
@@ -848,6 +939,7 @@ load_saved_state() {
   [[ -n "$ENABLE_DNS_REFLECTION_GUARD_EXPLICIT" || -z "${SAVED_ENABLE_DNS_REFLECTION_GUARD:-}" ]] || ENABLE_DNS_REFLECTION_GUARD="$SAVED_ENABLE_DNS_REFLECTION_GUARD"
   [[ -n "$ENABLE_BITTORRENT_GUARD_EXPLICIT" || -z "${SAVED_ENABLE_BITTORRENT_GUARD:-}" ]] || ENABLE_BITTORRENT_GUARD="$SAVED_ENABLE_BITTORRENT_GUARD"
   [[ -n "$ENABLE_BBR_EXPLICIT" || -z "${SAVED_ENABLE_BBR:-}" ]] || ENABLE_BBR="$SAVED_ENABLE_BBR"
+  [[ -n "$ENABLE_QUIC_TUNING_EXPLICIT" || -z "${SAVED_ENABLE_QUIC_TUNING:-}" ]] || ENABLE_QUIC_TUNING="$SAVED_ENABLE_QUIC_TUNING"
   [[ -n "$AUTO_SWAP_EXPLICIT" || -z "${SAVED_AUTO_SWAP:-}" ]] || AUTO_SWAP="$SAVED_AUTO_SWAP"
   [[ -n "$ENABLE_MAINTENANCE_EXPLICIT" || -z "${SAVED_ENABLE_MAINTENANCE:-}" ]] || ENABLE_MAINTENANCE="$SAVED_ENABLE_MAINTENANCE"
   [[ -n "$BACKUP_RETENTION_EXPLICIT" || -z "${SAVED_BACKUP_RETENTION:-}" ]] || BACKUP_RETENTION="$SAVED_BACKUP_RETENTION"
@@ -856,7 +948,9 @@ load_saved_state() {
   [[ -n "$EXPECT_HYSTERIA_EXPLICIT" || -z "${SAVED_EXPECT_HYSTERIA:-}" ]] || EXPECT_HYSTERIA="$SAVED_EXPECT_HYSTERIA"
   [[ -n "$HYSTERIA_PORT_EXPLICIT" || -z "${SAVED_HYSTERIA_PORT:-}" ]] || HYSTERIA_PORT="$SAVED_HYSTERIA_PORT"
 
-  if [[ "$MODE" == "repair" ]]; then
+  # Status describes the installed release. All mutation modes target this
+  # installer's pinned release unless explicitly overridden by the operator.
+  if [[ "$MODE" == "status" ]]; then
     [[ -n "$NODE_VERSION_EXPLICIT" || -z "${SAVED_NODE_VERSION:-}" ]] || NODE_VERSION="$SAVED_NODE_VERSION"
     [[ -n "$NODE_IMAGE_EXPLICIT" || -z "${SAVED_NODE_IMAGE:-}" ]] || NODE_IMAGE_INPUT="$SAVED_NODE_IMAGE"
   fi
@@ -927,7 +1021,7 @@ validate_secret_basic() {
   [[ -n "$SECRET_VALUE" ]] || die "SECRET_KEY пустой."
   [[ "$SECRET_VALUE" != *$'\n'* && "$SECRET_VALUE" != *$'\r'* ]] || die "SECRET_KEY содержит перенос строки."
   [[ "$SECRET_VALUE" =~ ^[A-Za-z0-9_+/=-]+$ ]] || die "SECRET_KEY содержит недопустимые символы."
-  (( ${#SECRET_VALUE} >= 128 )) || die "SECRET_KEY слишком короткий для Node 2.8.0."
+  (( ${#SECRET_VALUE} >= 128 && ${#SECRET_VALUE} <= 131072 )) || die "Некорректная длина SECRET_KEY для Node 3.x."
 }
 
 validate_secret_payload() {
@@ -969,7 +1063,7 @@ for key, name in files.items():
   then
     rm -rf "$check_dir"
     SECRET_CHECK_DIR=""
-    die "SECRET_KEY не является валидным payload RemnaNode 2.8.0. Скопируйте его заново из панели."
+    die "SECRET_KEY не является валидным PKI payload RemnaNode 3.x. Скопируйте его заново из обновлённой панели."
   fi
 
   if ! openssl x509 -in "$check_dir/ca.pem" -checkend "$TLS_MIN_VALID_SECONDS" -noout >/dev/null 2>&1 || \
@@ -1050,7 +1144,7 @@ collect_inputs() {
       [[ -n "$TLS_CERT_FILE" && -n "$TLS_KEY_FILE" ]] || \
         die "Для Hysteria нужно задать и TLS_CERT_FILE, и TLS_KEY_FILE."
     elif [[ ! -r "$TLS_DIR/fullchain.pem" || ! -r "$TLS_DIR/privkey.pem" ]]; then
-      die "Hysteria требует TLS. Включите xHTTP с доменом, задайте TLS_CERT_FILE/TLS_KEY_FILE или используйте --no-hysteria."
+      warn "Локальная TLS-пара Hysteria отсутствует: сертификат должен передаваться панелью в профиле. Иначе задайте TLS_CERT_FILE/TLS_KEY_FILE."
     fi
   fi
   detect_existing_secret
@@ -1084,8 +1178,13 @@ preflight_host() {
   local docker_root="/var/lib/docker"
   local backup_device=""
   local docker_device=""
+  local listener_pid=""
+  local node_pids=""
+  local listener_line=""
 
   [[ -r /etc/os-release ]] || die "Не удалось определить ОС."
+  [[ ! -L "$NODE_ROOT" && ! -L "$TLS_DIR" && ! -L "$STATE_DIR" && ! -L "$BACKUP_ROOT" ]] || \
+    die "Управляемые каталоги не должны быть symlink: Node/TLS/state/backup. Проверьте пути вручную."
   # shellcheck disable=SC1091
   source /etc/os-release
   os_id="${ID:-}"
@@ -1101,7 +1200,7 @@ preflight_host() {
   arch="$(uname -m)"
   case "$arch" in
     x86_64|amd64|aarch64|arm64) ;;
-    *) die "RemnaNode 2.8.0 не публикуется для архитектуры $arch." ;;
+    *) die "Официальный RemnaNode поддерживает linux/amd64 и linux/arm64, обнаружено: $arch." ;;
   esac
 
   kernel="$(uname -r | cut -d- -f1)"
@@ -1172,21 +1271,20 @@ preflight_host() {
     die "Обнаружен активный firewalld. Отключите его или запустите с --no-firewall и настройте ${NODE_PORT}/tcp вручную."
   fi
   if command -v docker >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
-    warn "Docker установлен, но daemon пока недоступен. Пытаюсь безопасно поднять Docker перед backup/preflight."
-    systemctl enable containerd.service >/dev/null 2>&1 || true
-    systemctl start containerd.service >/dev/null 2>&1 || true
-    systemctl enable docker.socket >/dev/null 2>&1 || true
-    systemctl enable docker.service >/dev/null 2>&1 || true
-    systemctl start docker.service >/dev/null 2>&1 || true
-    sleep 2
-    docker info >/dev/null 2>&1 || \
-      die "Docker установлен, но daemon недоступен даже после автоматического запуска. Проверьте systemctl status docker containerd."
+    die "Docker daemon недоступен. Не запускаю его в preflight: иначе можно запустить намеренно остановленные контейнеры. Проверьте Docker и запустите его вручную перед полным backup."
   fi
   if command -v ss >/dev/null 2>&1; then
-    control_listener="$(ss -H -ltnp "( sport = :$NODE_PORT )" 2>/dev/null | head -n1 || true)"
-    if [[ -n "$control_listener" ]] && \
-       { ! command -v docker >/dev/null 2>&1 || ! docker inspect remnanode >/dev/null 2>&1; }; then
-      die "Control port $NODE_PORT уже занят посторонним процессом: $control_listener"
+    control_listener="$(ss -H -ltnp "( sport = :$NODE_PORT )" 2>/dev/null || true)"
+    if [[ -n "$control_listener" ]]; then
+      # The mere existence of a remnanode container does not make every
+      # listener its own. In particular never firewall the host SSH port.
+      node_pids="$(docker top remnanode -eo pid 2>/dev/null | awk 'NR>1 {print $1}' || true)"
+      while IFS= read -r listener_line; do
+        listener_pid="$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener_line")"
+        if [[ -z "$listener_pid" ]] || ! grep -Fxq "$listener_pid" <<<"$node_pids"; then
+          die "Control port $NODE_PORT занят не подтверждённым процессом ноды: $listener_line"
+        fi
+      done <<<"$control_listener"
     fi
   fi
 
@@ -1212,10 +1310,11 @@ print_plan() {
     "$ENABLE_SPAMHAUS_EGRESS_GUARD" "$ENABLE_OUTBOUND_SSH_GUARD" \
     "$ENABLE_DNS_REFLECTION_GUARD" "$ENABLE_BITTORRENT_GUARD"
   printf '  BBR baseline:     %s\n' "$ENABLE_BBR"
+  printf '  offload/qdisc:    %s (host-wide, opt-in)\n' "$ENABLE_QUIC_TUNING"
   printf '  automatic swap:   %s\n' "$AUTO_SWAP"
   printf '  safe maintenance: %s (keep %s backups)\n' "$ENABLE_MAINTENANCE" "$BACKUP_RETENTION"
   printf '  native plugins:   %s\n' "$REQUIRE_NODE_PLUGINS"
-  printf '  Hysteria check:   udp/%s\n' "$HYSTERIA_PORT"
+  printf '  Hysteria check:   %s, udp/%s\n' "$EXPECT_HYSTERIA" "$HYSTERIA_PORT"
   if bool_true "$ENABLE_XHTTP"; then
     printf '  xHTTP domain:     %s\n' "$XHTTP_DOMAIN"
     printf '  xHTTP path:       %s\n' "$XHTTP_PATH"
@@ -1239,10 +1338,13 @@ apt_retry() {
     fi
     log_path="$(apt_log_path_for_attempt "apt-${attempt}")"
     APT_LAST_LOG="$log_path"
-    if apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_TIMEOUT" "$@" 2>&1 | tee "$log_path"; then
+    if apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_TIMEOUT" -o APT::Update::Error-Mode=any "$@" 2>&1 | tee "$log_path"; then
       return 0
+    else
+      # Capture the failed pipeline here. `$?` AFTER `fi` is zero without an
+      # else branch, which previously reported four failed attempts as success.
+      rc=$?
     fi
-    rc=$?
     if apt_output_contains_dns_error "$log_path"; then
       warn "apt-get $* завершился DNS-ошибкой; пробую восстановить resolver и повторить."
       prepare_package_network || true
@@ -1273,6 +1375,9 @@ install_base_packages() {
 ensure_docker() {
   local installer=""
 
+  if command -v docker >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
+    die "Docker уже установлен без Compose plugin. Установите совместимый Docker Compose v2/v5 и повторите: существующий Engine автоматически не заменяю."
+  fi
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     systemctl enable docker.service >/dev/null || die "Не удалось включить Docker при загрузке."
     systemctl start docker.service >/dev/null || die "Не удалось запустить Docker."
@@ -1282,7 +1387,7 @@ ensure_docker() {
 
   log "Устанавливаю Docker Engine и Compose plugin официальным способом"
   installer="$(mktemp /tmp/get-docker.XXXXXX.sh)"
-  curl -fsSL --retry 4 --retry-delay 3 https://get.docker.com -o "$installer"
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 4 --retry-delay 3 https://get.docker.com -o "$installer"
   sh "$installer"
   rm -f "$installer"
   systemctl enable docker.service >/dev/null
@@ -1395,6 +1500,7 @@ backup_system_paths() {
     "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" \
     "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" \
     "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" "$TLS_DIR" "$PANEL_IPS_FILE" \
+    /etc/nginx/conf.d/00-remnanode-hash-tuning.conf \
     /etc/fstab /etc/nginx/nginx.conf /etc/ufw/user.rules /etc/ufw/user6.rules; do
     [[ -e "$path" || -L "$path" ]] || continue
     case " ${relative[*]} " in
@@ -1550,7 +1656,7 @@ create_backup() {
   backup_sysctl_runtime
 
   {
-    printf 'BACKUP_FORMAT=%q\n' "2"
+    printf 'BACKUP_FORMAT=%q\n' "3"
     printf 'CREATED_AT=%q\n' "$timestamp"
     printf 'HAD_NODE_ROOT=%q\n' "$had_node_root"
     printf 'HAD_CONTAINER=%q\n' "$had_container"
@@ -1567,6 +1673,22 @@ create_backup() {
     printf 'PREVIOUS_MANAGED_ACTIVE_UNITS=%q\n' "$previous_managed_active_units"
   } >"$BACKUP_DIR/manifest.env"
   chmod 0600 "$BACKUP_DIR/manifest.env"
+
+  # Do not publish an incomplete backup or touch the running installation
+  # until every archive and its checksum are readable.
+  [[ ! -f "$BACKUP_DIR/node-root.tgz" ]] || tar -tzf "$BACKUP_DIR/node-root.tgz" >/dev/null
+  [[ ! -f "$BACKUP_DIR/system-files.tgz" ]] || tar -tzf "$BACKUP_DIR/system-files.tgz" >/dev/null
+  (
+    cd "$BACKUP_DIR"
+    local -a files=(manifest.env sysctl-runtime.tsv)
+    local file=""
+    for file in node-root.tgz system-files.tgz previous-image.tar.gz; do
+      [[ ! -f "$file" ]] || files+=("$file")
+    done
+    sha256sum "${files[@]}" >SHA256SUMS
+    chmod 0600 SHA256SUMS
+    sha256sum --check --strict SHA256SUMS >/dev/null
+  )
 
   mv "$BACKUP_DIR" "$final_backup"
   BACKUP_STAGE_DIR=""
@@ -1585,7 +1707,11 @@ remove_known_current_files_for_rollback() {
     "$CERT_DEPLOY_HOOK" "$NGINX_CAPACITY_DROPIN" "$MAINTENANCE_SCRIPT" "$MAINTENANCE_SERVICE" \
     "$MAINTENANCE_TIMER" "$XHTTP_GUARD_SCRIPT" "$XHTTP_GUARD_SERVICE" "$XHTTP_GUARD_TIMER" \
     "$QUIC_RUNTIME_SCRIPT" "$QUIC_RUNTIME_SERVICE" \
-    "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER"
+    "$SPAMHAUS_EGRESS_GUARD_SCRIPT" "$SPAMHAUS_EGRESS_GUARD_SERVICE" "$SPAMHAUS_EGRESS_GUARD_TIMER" \
+    "$OUTBOUND_SSH_GUARD_SCRIPT" "$OUTBOUND_SSH_GUARD_SERVICE" \
+    "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" \
+    "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" \
+    "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" /etc/nginx/conf.d/00-remnanode-hash-tuning.conf
   while IFS= read -r path; do
     rm -f -- "$path"
   done < <(legacy_paths)
@@ -1705,8 +1831,17 @@ rollback_from_backup() {
   local sysctl_extra=""
 
   [[ -r "$backup/manifest.env" ]] || die "Некорректный backup: $backup"
+  require_trusted_root_file "$backup/manifest.env"
+  if [[ -f "$backup/SHA256SUMS" ]]; then
+    require_trusted_root_file "$backup/SHA256SUMS"
+    (cd "$backup" && sha256sum --check --strict SHA256SUMS >/dev/null) || die "Backup checksum mismatch; откат не начат."
+  elif grep -qx 'BACKUP_FORMAT=3' "$backup/manifest.env"; then
+    die "Backup format 3 без SHA256SUMS неполный; откат не начат."
+  else
+    warn "Legacy backup format 2: контрольных сумм нет; проверю архивы перед откатом."
+  fi
   ROLLBACK_RUNNING=1
-  # shellcheck disable=SC1090
+  # shellcheck disable=SC1090,SC1091
   source "$backup/manifest.env"
   backup_format="${BACKUP_FORMAT:-}"
   had_node_root="${HAD_NODE_ROOT:-0}"
@@ -1723,8 +1858,8 @@ rollback_from_backup() {
   had_image_archive="${HAD_IMAGE_ARCHIVE:-0}"
   had_system_files="${HAD_SYSTEM_FILES:-0}"
 
-  [[ "$backup_format" == "2" ]] || \
-    die "Backup schema $backup_format не поддерживается этим installer; нужен format 2."
+  [[ "$backup_format" == "2" || "$backup_format" == "3" ]] || \
+    die "Backup schema $backup_format не поддерживается; нужен format 2/3."
   for unit in "$had_node_root" "$had_container" "$was_running" "$had_swap_file" \
     "$was_swap_active" "$had_image_archive" "$had_system_files"; do
     [[ "$unit" == "0" || "$unit" == "1" ]] || die "Manifest backup содержит некорректный boolean."
@@ -1762,6 +1897,12 @@ rollback_from_backup() {
     done <"$backup/sysctl-runtime.tsv"
   fi
 
+  if bool_true "$DRY_RUN"; then
+    log "Dry-run rollback: архивы проверены; были бы восстановлены конфигурация, image и состояния служб из $backup. Изменений нет."
+    ROLLBACK_RUNNING=0
+    return 0
+  fi
+
   log "Выполняю rollback из $backup"
   if [[ "$had_node_root" == "1" ]]; then
     ROLLBACK_STAGE_DIR="$(mktemp -d /opt/.remnanode-rollback.XXXXXX)"
@@ -1795,6 +1936,15 @@ rollback_from_backup() {
   systemctl disable --now remnanode-xhttp-socket-guard.timer >/dev/null 2>&1 || true
   systemctl stop remnanode-xhttp-socket-guard.service >/dev/null 2>&1 || true
   systemctl disable --now remnanode-quic-runtime.service >/dev/null 2>&1 || true
+  for unit in remnanode-spamhaus-egress-guard.timer remnanode-spamhaus-egress-guard.service \
+    remnanode-outbound-ssh-guard.service remnanode-dns-reflection-guard.service remnanode-bittorrent-guard.service; do
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  done
+  for unit in remnanode_spamhaus_egress_guard remnanode_outbound_ssh_guard \
+    remnanode_dns_reflection_guard remnanode_bittorrent_guard; do
+    nft delete table inet "$unit" >/dev/null 2>&1 || true
+  done
+  remove_bittorrent_string_runtime
   rm -f -- "$XHTTP_GUARD_MARKER"
   systemctl disable remnanode-firewall.service >/dev/null 2>&1 || true
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1844,9 +1994,16 @@ rollback_from_backup() {
       rollback_failed=1
     fi
     if (( image_ready == 1 )); then
-      docker tag "$previous_image_id" "$previous_image" >/dev/null 2>&1 || rollback_failed=1
+      # Digest-only images cannot be passed to `docker tag`. An explicit
+      # override also prevents a moved registry tag from changing rollback.
+      if [[ "$previous_image" != *@* && "$previous_image" != sha256:* ]]; then
+        docker tag "$previous_image_id" "$previous_image" >/dev/null 2>&1 || rollback_failed=1
+      fi
+      printf 'services:\n  remnanode:\n    image: "%s"\n' "$previous_image_id" >"$NODE_ROOT/.rollback-image.yml"
+      chmod 0600 "$NODE_ROOT/.rollback-image.yml"
+      rollback_compose_args+=(-f "$NODE_ROOT/.rollback-image.yml")
       if ! docker compose --project-directory "$NODE_ROOT" "${rollback_compose_args[@]}" \
-        up -d --force-recreate; then
+        up -d --force-recreate --no-deps --no-build --pull never remnanode; then
         rollback_failed=1
       fi
       if [[ "$was_running" == "0" ]]; then
@@ -1961,7 +2118,8 @@ rollback_from_backup() {
       nft delete table inet remnanode_installer >/dev/null 2>&1 || true
   fi
   systemctl restart systemd-journald.service >/dev/null 2>&1 || true
-  sysctl --system >/dev/null 2>&1 || true
+  # Restore only the keys recorded by this installer, never reapply every
+  # unrelated sysctl configuration on the host.
   if [[ -r "$backup/sysctl-runtime.tsv" ]]; then
     while IFS=$'\t' read -r sysctl_key sysctl_value sysctl_extra; do
       sysctl -w "$sysctl_key=$sysctl_value" >/dev/null 2>&1 || rollback_failed=1
@@ -1975,6 +2133,7 @@ rollback_from_backup() {
     failed_copy=""
   fi
   ROLLBACK_RUNNING=0
+  warn "Откат не отменяет установку пакетов ОС, выпущенные ACME-сертификаты и runtime offload/qdisc. При включённом tuning может понадобиться плановая перезагрузка."
   if (( rollback_failed != 0 )); then
     warn "Rollback восстановил файлы, но одна или несколько служб не вернулись в ожидаемое состояние."
     return 1
@@ -1986,6 +2145,11 @@ on_error() {
   local rc="$1"
   local line="$2"
   trap - ERR INT TERM
+  # ERR is inherited by command substitutions/pipelines. Recovery must run
+  # once in the owning shell, not twice concurrently from a child and parent.
+  if [[ "$BASHPID" != "$INSTALLER_MAIN_BASHPID" ]]; then
+    exit "$rc"
+  fi
   printf '\n[ERROR] Installer остановлен на строке %s (код %s).\n' "$line" "$rc" >&2
   if [[ -n "$APT_LAST_LOG" && -r "$APT_LAST_LOG" ]]; then
     printf '[ERROR] Последний apt log: %s\n' "$APT_LAST_LOG" >&2
@@ -1997,6 +2161,7 @@ on_error() {
 }
 
 cleanup_stage() {
+  [[ "$BASHPID" == "$INSTALLER_MAIN_BASHPID" ]] || return 0
   [[ -z "$STAGE_DIR" || ! -d "$STAGE_DIR" ]] || rm -rf "$STAGE_DIR"
   [[ -z "$SECRET_CHECK_DIR" || ! -d "$SECRET_CHECK_DIR" ]] || rm -rf "$SECRET_CHECK_DIR"
   [[ -z "$ROLLBACK_STAGE_DIR" || ! -d "$ROLLBACK_STAGE_DIR" ]] || rm -rf "$ROLLBACK_STAGE_DIR"
@@ -2057,7 +2222,7 @@ stop_legacy_units() {
 cleanup_legacy_firewall_runtime() {
   local bin=""
   nft delete table inet remnanode_guard >/dev/null 2>&1 || true
-  nft delete table inet remnanode_spamhaus_egress_guard >/dev/null 2>&1 || true
+  # Keep the active Spamhaus table until its replacement has valid data.
 
   for bin in iptables ip6tables; do
     command -v "$bin" >/dev/null 2>&1 || continue
@@ -2267,6 +2432,18 @@ configure_quic_runtime_tuning() {
   local cpu_count=1
   local mem_mb=0
   local profile="balanced"
+
+  if ! bool_true "$ENABLE_QUIC_TUNING"; then
+    if [[ -f "$QUIC_RUNTIME_SERVICE" ]]; then
+      warn "Отключаю installer QUIC tuning при загрузке. Ранее изменённые offload/qdisc восстановятся после плановой перезагрузки."
+      LEGACY_RUNTIME_TUNING_DETECTED=1
+    fi
+    systemctl disable --now remnanode-quic-runtime.service >/dev/null 2>&1 || true
+    rm -f "$QUIC_RUNTIME_SCRIPT" "$QUIC_RUNTIME_SERVICE"
+    systemctl daemon-reload
+    return 0
+  fi
+  warn "Opt-in QUIC tuning меняет настройки всего uplink-интерфейса; rollback не гарантирует восстановление runtime до reboot."
 
   bool_true "$EXPECT_HYSTERIA" && expect_hysteria_flag=1
   bool_true "$ENABLE_BBR" && enable_bbr_flag=1
@@ -2798,9 +2975,8 @@ fetch_url() {
   fi
 }
 
-for url in \
-  "https://www.spamhaus.org/drop/drop.txt" \
-  "https://www.spamhaus.org/drop/edrop.txt"; do
+# EDROP was consolidated into DROP; do not depend on the retired endpoint.
+for url in "https://www.spamhaus.org/drop/drop.txt"; do
   fetch_url "$url" >>"$RAW" || true
   printf '\n' >>"$RAW"
 done
@@ -2843,7 +3019,8 @@ elements_block=""
 if [[ -s "$ELEMENTS" ]]; then
   elements_block="$(sed 's/^/        /' "$ELEMENTS")"
 else
-  echo "Spamhaus DROP/EDROP list is unavailable or empty; installing empty guard table and keeping timer refresh enabled." >&2
+  echo "Spamhaus DROP is unavailable or empty; keeping the previous rules intact and retrying on the timer." >&2
+  exit 1
 fi
 
 cat >>"$RULES" <<NFT
@@ -2876,7 +3053,7 @@ EOF
 
   cat >"$SPAMHAUS_EGRESS_GUARD_SERVICE" <<EOF
 [Unit]
-Description=RemnaNode Spamhaus DROP/EDROP egress guard
+Description=RemnaNode Spamhaus DROP egress guard
 Documentation=man:nft(8)
 After=network-online.target nftables.service
 Wants=network-online.target
@@ -2885,7 +3062,8 @@ Before=docker.service
 [Service]
 Type=oneshot
 ExecStart=$SPAMHAUS_EGRESS_GUARD_SCRIPT
-RemainAfterExit=yes
+# Must return to inactive, otherwise the periodic timer will not rerun it.
+RemainAfterExit=no
 
 [Install]
 WantedBy=multi-user.target
@@ -2893,7 +3071,7 @@ EOF
 
   cat >"$SPAMHAUS_EGRESS_GUARD_TIMER" <<'EOF'
 [Unit]
-Description=Refresh RemnaNode Spamhaus DROP/EDROP egress guard
+Description=Refresh RemnaNode Spamhaus DROP egress guard
 
 [Timer]
 OnBootSec=2min
@@ -3933,7 +4111,7 @@ configure_xhttp_module() {
       copy_tls_pair "$TLS_DIR/fullchain.pem" "$TLS_DIR/privkey.pem"
       warn "Использую существующий TLS для Hysteria; при отключённом xHTTP его продление остаётся внешней ответственностью."
     elif bool_true "$EXPECT_HYSTERIA"; then
-      die "TLS-файлы Hysteria отсутствуют в $TLS_DIR. Задайте xHTTP domain либо TLS_CERT_FILE/TLS_KEY_FILE."
+      warn "Hysteria: локальных TLS-файлов нет; ожидается сертификат в конфигурации от панели."
     fi
     return 0
   fi
@@ -4328,6 +4506,8 @@ select_and_pull_image() {
           break
         fi
         SELECTED_IMAGE="$image"
+        SELECTED_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$image")"
+        [[ "$SELECTED_IMAGE_ID" =~ ^sha256:[a-f0-9]{64}$ ]] || die "Не удалось зафиксировать image ID после pull."
         return 0
       fi
       sleep $((attempt * 4))
@@ -4338,6 +4518,7 @@ select_and_pull_image() {
 
 render_node_files() {
   local shm_mount=""
+  local setting="" value=""
 
   STAGE_DIR="$(mktemp -d /tmp/remnanode-stage.XXXXXX)"
   chmod 0700 "$STAGE_DIR"
@@ -4345,6 +4526,21 @@ render_node_files() {
   {
     printf 'NODE_PORT=%s\n' "$NODE_PORT"
     printf 'SECRET_KEY=%s\n' "$SECRET_VALUE"
+    # Only documented Node 3.4.1 booleans may be carried forward. Never inherit
+    # old CUSTOM_CORE_URL, patched entrypoints or generated internal tokens.
+    for setting in DISABLE_HASHED_SET_CHECK NFTABLES_LOGGING NFTABLES_ACCEPT_REPLY_TRAFFIC SNI_VERIFICATION; do
+      value="${!setting-}"
+      if [[ -z "$value" && -r "$ENV_FILE" ]]; then
+        value="$(sed -n "s/^${setting}=//p" "$ENV_FILE" | tail -n1)"
+        value="$(trim "$value")"
+        value="${value%\"}"; value="${value#\"}"
+        value="${value%\'}"; value="${value#\'}"
+      fi
+      [[ -n "$value" ]] || continue
+      bool_valid "$value" || die "$setting в окружении/.env должен быть boolean."
+      if bool_true "$value"; then value=true; else value=false; fi
+      printf '%s=%s\n' "$setting" "$value"
+    done
   } >"$STAGE_DIR/.env"
   chmod 0600 "$STAGE_DIR/.env"
 
@@ -4424,9 +4620,11 @@ container_needs_recreate() {
 }
 
 activate_node() {
+  [[ "$(docker image inspect --format '{{.Id}}' "$SELECTED_IMAGE")" == "$SELECTED_IMAGE_ID" ]] || \
+    die "Image tag изменился между pull и запуском; активация отменена."
   if container_needs_recreate; then
     log "Применяю RemnaNode $NODE_VERSION"
-    docker compose --project-directory "$NODE_ROOT" -f "$COMPOSE_FILE" up -d --force-recreate --remove-orphans
+    docker compose --project-directory "$NODE_ROOT" -f "$COMPOSE_FILE" up -d --force-recreate --no-deps --no-build --pull never remnanode
     INSTALL_CHANGED=1
   else
     log "Конфигурация и image уже актуальны; контейнер не перезапускаю."
@@ -4486,6 +4684,7 @@ verify_native_plugins() {
 
 profile_not_ready() {
   local message="$1"
+  PROFILE_VERIFIED=0
   if bool_true "$REQUIRE_PROFILE_READY"; then
     die "$message"
   fi
@@ -4499,7 +4698,7 @@ verify_local_xhttp_h2_edge() {
     headers="$(curl -ksS --http2 --noproxy '*' --connect-timeout 3 --max-time 8 \
       --resolve "$XHTTP_DOMAIN:443:127.0.0.1" -o /dev/null -D - \
       "https://$XHTTP_DOMAIN$XHTTP_PATH" 2>/dev/null || true)"
-    if grep -qE '^HTTP/[^ ]+ 400([[:space:]]|$)' <<<"$headers"; then
+    if grep -qE '^HTTP/2 400([[:space:]]|$)' <<<"$headers"; then
       return 0
     fi
     sleep 2
@@ -4513,11 +4712,17 @@ verify_profile_transports() {
   local hysteria_ready=1
   local alpn_output=""
   local listener_line=""
+  local core_ready=0
 
   bool_true "$VERIFY_PROFILE_TRANSPORTS" || return 0
+  PROFILE_VERIFIED=1
   log "Проверяю runtime-пути профиля STABLE-IN-443 и Hysteria"
 
   while (( SECONDS <= deadline )); do
+    core_ready=0
+    if [[ "$(docker exec remnanode /command/s6-svstat -o up /run/service/xray 2>/dev/null || true)" == true ]]; then
+      core_ready=1
+    fi
     xhttp_ready=1
     hysteria_ready=1
     if bool_true "$ENABLE_XHTTP"; then
@@ -4527,10 +4732,12 @@ verify_profile_transports() {
     if bool_true "$EXPECT_HYSTERIA"; then
       udp_port_listening "$HYSTERIA_PORT" || hysteria_ready=0
     fi
-    (( xhttp_ready == 1 && hysteria_ready == 1 )) && break
+    (( core_ready == 1 && xhttp_ready == 1 && hysteria_ready == 1 )) && break
     (( SECONDS >= deadline )) && break
     sleep 2
   done
+
+  (( core_ready == 1 )) || profile_not_ready "Xray не запущен под s6: назначьте валидный профиль в панели и проверьте xray-logs."
 
   if bool_true "$ENABLE_XHTTP"; then
     systemctl is-active --quiet nginx.service || die "Nginx для xHTTP не активен."
@@ -4550,8 +4757,8 @@ verify_profile_transports() {
   fi
 
   if bool_true "$EXPECT_HYSTERIA"; then
-    [[ -r "$TLS_DIR/fullchain.pem" && -r "$TLS_DIR/privkey.pem" ]] || \
-      profile_not_ready "Для Hysteria нет TLS-файлов $TLS_DIR/fullchain.pem и privkey.pem."
+    # Node 3.x may receive inline certificates from the panel. Host files are
+    # therefore optional; a bound UDP socket is still NOT an authenticated test.
     udp_port_listening "$HYSTERIA_PORT" || \
       profile_not_ready "Hysteria не слушает UDP/$HYSTERIA_PORT: проверьте BBR-IN-443 в назначенном профиле."
     listener_line="$(hysteria_listener_line)"
@@ -4583,12 +4790,12 @@ verify_node() {
     die "Контейнер remnanode не запущен."
   port_listening || die "Node control-port $NODE_PORT не слушает."
 
-  logs="$(docker logs --tail 300 remnanode 2>&1 || true)"
+  logs="$(docker logs --since "$(docker inspect --format '{{.State.StartedAt}}' remnanode)" --tail 300 remnanode 2>&1 || true)"
   if grep -Eqi 'Invalid SECRET_KEY|SECRET_KEY is not set|invalid node payload|FATAL|UnhandledPromiseRejection' <<<"$logs"; then
     die "RemnaNode сообщил об ошибке SECRET_KEY или критическом старте."
   fi
   running_id="$(docker inspect --format '{{.Image}}' remnanode)"
-  desired_id="$(docker image inspect --format '{{.Id}}' "$SELECTED_IMAGE")"
+  desired_id="$SELECTED_IMAGE_ID"
   [[ "$running_id" == "$desired_id" ]] || die "Контейнер запущен не из выбранного image $SELECTED_IMAGE."
 
   cap_eff="$(docker exec remnanode awk '/^CapEff:/ {print $2}' /proc/1/status 2>/dev/null || true)"
@@ -4604,13 +4811,13 @@ PY
     if bool_true "$ALLOW_NO_NET_ADMIN"; then
       warn "CAP_NET_ADMIN не подтверждён: online count и Node Plugins могут не работать."
     else
-      die "CAP_NET_ADMIN недоступен. Без него нативный online count Node 2.8.0 неполный."
+      die "CAP_NET_ADMIN недоступен. Native Node 3.x plugins и connection drop не гарантированы."
     fi
   fi
 
   xray_version="$(docker exec remnanode rw-core version 2>/dev/null | head -n1 || true)"
   [[ "$xray_version" =~ Xray[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+) ]] || die "Не удалось определить встроенный Xray."
-  version_ge "${BASH_REMATCH[1]}" "26.6.27" || die "Xray ${BASH_REMATCH[1]} старее 26.6.27."
+  version_ge "${BASH_REMATCH[1]}" "$MIN_XRAY_VERSION" || die "Xray ${BASH_REMATCH[1]} старее $MIN_XRAY_VERSION."
 
   verify_native_plugins
 
@@ -4629,6 +4836,10 @@ PY
   verify_profile_transports
 
   log "Node verification OK: $xray_version; restart_count=$restarts_before"
+  if (( PROFILE_VERIFIED == 0 )); then
+    warn "VPN profile readiness НЕ подтверждена. Проверьте назначение профиля и логи; Node API readiness не равна готовности VPN."
+  fi
+  warn "Проверки локальные: связь мастер-панели, внешняя маршрутизация и подключение клиентом требуют отдельного end-to-end теста."
 }
 
 write_state() {
@@ -4654,6 +4865,7 @@ write_state() {
     printf 'SAVED_ENABLE_DNS_REFLECTION_GUARD=%q\n' "$ENABLE_DNS_REFLECTION_GUARD"
     printf 'SAVED_ENABLE_BITTORRENT_GUARD=%q\n' "$ENABLE_BITTORRENT_GUARD"
     printf 'SAVED_ENABLE_BBR=%q\n' "$ENABLE_BBR"
+    printf 'SAVED_ENABLE_QUIC_TUNING=%q\n' "$ENABLE_QUIC_TUNING"
     printf 'SAVED_AUTO_SWAP=%q\n' "$AUTO_SWAP"
     printf 'SAVED_ENABLE_MAINTENANCE=%q\n' "$ENABLE_MAINTENANCE"
     printf 'SAVED_BACKUP_RETENTION=%q\n' "$BACKUP_RETENTION"
@@ -4728,7 +4940,7 @@ print_profile_contract() {
     printf '  xHTTP edge:    TCP/443 TLS + HTTP/2 через Nginx; HTTP/3 на Nginx отключён\n'
   fi
   if bool_true "$EXPECT_HYSTERIA"; then
-    printf '  BBR-IN-443:    Hysteria 2 на UDP/%s, TLS из %s\n' "$HYSTERIA_PORT" "$TLS_DIR"
+    printf '  BBR-IN-443:    Hysteria 2 на UDP/%s, TLS из панели либо %s\n' "$HYSTERIA_PORT" "$TLS_DIR"
     printf '  Hysteria BBR:  finalmask.quicParams.congestion=bbr задаётся именно в JSON профиля\n'
     printf '  Hysteria LTE:  finalmask.quicParams.disablePathMTUDiscovery=true рекомендуется для проблемных мобильных сетей\n'
   fi
@@ -4839,20 +5051,20 @@ select_rollback_backup() {
   if [[ -z "$selected" ]]; then
     while IFS= read -r candidate; do
       [[ -r "$candidate/manifest.env" ]] || continue
-      grep -qx 'BACKUP_FORMAT=2' "$candidate/manifest.env" || continue
+      grep -Eqx 'BACKUP_FORMAT=(2|3)' "$candidate/manifest.env" || continue
       selected="$candidate"
       break
     done < <(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d \
       -regextype posix-extended -regex '.*/[0-9]{8}T[0-9]{6}Z' -print 2>/dev/null | sort -r)
   fi
-  [[ -n "$selected" ]] || die "Не найден полный backup format 2 в $BACKUP_ROOT."
+  [[ -n "$selected" ]] || die "Не найден полный backup format 2/3 в $BACKUP_ROOT."
   backup_root_real="$(realpath -e "$BACKUP_ROOT" 2>/dev/null || true)"
   selected="$(realpath -e "$selected" 2>/dev/null || true)"
   [[ -n "$backup_root_real" && -n "$selected" && "$selected" == "$backup_root_real"/* ]] || \
     die "Backup должен находиться в $BACKUP_ROOT."
   [[ "$(basename "$selected")" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || die "Некорректное имя backup: $selected"
   [[ -r "$selected/manifest.env" ]] || die "Не найден manifest backup: $selected"
-  grep -qx 'BACKUP_FORMAT=2' "$selected/manifest.env" || die "Backup не завершён или имеет неподдерживаемый format."
+  grep -Eqx 'BACKUP_FORMAT=(2|3)' "$selected/manifest.env" || die "Backup не завершён или имеет неподдерживаемый format."
   printf '%s' "$selected"
 }
 
@@ -4872,12 +5084,21 @@ run_install() {
     return 0
   fi
 
+  if ! bool_true "$YES"; then
+    bool_true "$(ask 'Применить этот план? Краткий перезапуск ноды прервёт подключения. [y/N]: ' || true)" || {
+      log "Отменено: изменений нет."
+      return 0
+    }
+  fi
+
   create_backup
-  stop_legacy_units
   install_base_packages
   ensure_docker
   validate_panel_ips_strict
   validate_secret_payload
+  select_and_pull_image
+  render_node_files
+  stop_legacy_units
   prepare_directories
   cleanup_legacy_files
   configure_small_swap
@@ -4888,8 +5109,6 @@ run_install() {
   write_firewall
   configure_antiabuse_guards
   configure_xhttp_module
-  select_and_pull_image
-  render_node_files
   install_rendered_files
   configure_xhttp_socket_guard
   activate_node
@@ -4901,7 +5120,7 @@ run_install() {
   record_legacy_reboot_requirement
 
   MUTATION_STARTED=0
-  log "Установка завершена успешно"
+  log "Установка Node завершена; готовность клиентского VPN проверяется отдельно"
   show_status
   print_profile_contract
   if legacy_reboot_required; then
@@ -4909,17 +5128,82 @@ run_install() {
   fi
   printf '\nBackup для ручного rollback: %s\n' "$BACKUP_DIR"
   printf 'Rollback: sudo bash setup-remnanode.sh rollback --backup %q\n' "$BACKUP_DIR"
+  printf 'Логи Node: sudo bash setup-remnanode.sh logs\n'
+  printf 'Логи Xray: sudo bash setup-remnanode.sh xray-logs\n'
+}
+
+follow_logs() {
+  local kind="$1"
+  local -a follow=()
+  bool_true "$DRY_RUN" || follow=(-f)
+  warn "Логи могут содержать IP клиентов и сведения о профиле. Не публикуйте их без проверки."
+  # The installer never prints .env or docker inspect Config.Env. Mask the
+  # exact current SECRET_KEY too, in case a upstream error included its value.
+  if [[ "$kind" == "logs" ]]; then
+    docker logs --timestamps --tail 200 "${follow[@]}" remnanode 2>&1 | redact_log_stream
+  else
+    [[ -f "$LOG_DIR/current" ]] || die "Нет $LOG_DIR/current. Проверьте назначение профиля и статус Xray."
+    tail -n 200 "${follow[@]}" "$LOG_DIR/current" | redact_log_stream
+  fi
+}
+
+redact_log_stream() {
+  python3 -u -c '
+import re, sys
+secret = ""
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        for line in stream:
+            if line.startswith("SECRET_KEY="):
+                secret = line.split("=", 1)[1].strip().strip(chr(34)).strip(chr(39))
+                break
+except OSError:
+    pass
+try:
+    for line in sys.stdin:
+        if secret:
+            line = line.replace(secret, "[SECRET_KEY REDACTED]")
+        line = re.sub(r"(?i)(SECRET_KEY\s*[=:]\s*)\S+", r"\1[REDACTED]", line)
+        print(line, end="", flush=True)
+except (BrokenPipeError, KeyboardInterrupt):
+    pass
+' "$ENV_FILE"
+}
+
+assert_local_docker_context() {
+  # Host-network mounts/firewall must never be combined with a remote daemon.
+  [[ -z "${DOCKER_HOST:-}" || "${DOCKER_HOST:-}" == unix:///var/run/docker.sock ]] || \
+    die "DOCKER_HOST должен указывать на локальный /var/run/docker.sock."
+  [[ -z "${DOCKER_CONTEXT:-}" || "${DOCKER_CONTEXT:-}" == default ]] || die "Нужен default Docker context."
+  if command -v docker >/dev/null 2>&1; then
+    [[ "$(docker context show 2>/dev/null)" == default ]] || die "Активен не default Docker context; переключите его вручную."
+    # Even a READ request to docker.socket can start an inactive daemon.
+    systemctl is-active --quiet docker.service || \
+      die "Docker daemon остановлен. Запустите его вручную; installer не использует socket activation для preflight/status/dry-run."
+  fi
 }
 
 main() {
   parse_args "$@"
+  if ! bool_valid "$DRY_RUN" || ! bool_valid "$YES"; then
+    die "DRY_RUN и YES должны быть boolean."
+  fi
+  (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )) || die "Нужен Bash 4.4+ на Linux."
+  [[ "$(uname -s)" == Linux ]] || die "Установщик запускается только на Linux-ноде, не на macOS/Windows."
   require_root
-  acquire_lock
+  assert_local_docker_context
+  if ! bool_true "$DRY_RUN" && [[ "$MODE" != status && "$MODE" != logs && "$MODE" != xray-logs ]]; then
+    acquire_lock
+  fi
 
   case "$MODE" in
     status)
       load_saved_state
       show_status
+      ;;
+    logs|xray-logs)
+      trap 'exit 0' INT TERM
+      follow_logs "$MODE"
       ;;
     rollback)
       rollback_from_backup "$(select_rollback_backup)"
