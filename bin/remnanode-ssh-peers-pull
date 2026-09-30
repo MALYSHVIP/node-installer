@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 
-URL = 'https://api.chernakovgame.ru/api/ssh-peers/manifest.json'
+URL = 'https://api.chernakovgame.ru/api/ssh-peers/manifest.php'
 ACK_URL = 'https://api.chernakovgame.ru/api/ssh-peers/ack.php'
 PUBLIC_KEY = Path('/etc/remnanode/ssh-peers-signing.pub')
 PUBLIC_KEY_SHA256 = '0e2d38540c5c693a8ce4d2c5a39bafa8089c5b06d03caa309a1e4a250660cba9'
@@ -133,9 +133,18 @@ def send_ack(ip, token, generation, digest, status):
           ACK_URL, input_bytes=body, timeout=16)
 
 
+def fetch_manifest(ip, token):
+    timestamp = str(int(time.time()))
+    message = ('manifest\n' + ip + '\n' + timestamp).encode()
+    auth = hmac.new(token, message, hashlib.sha256).hexdigest()
+    return https('-H', 'X-Peer-Ip: ' + ip,
+                 '-H', 'X-Peer-Time: ' + timestamp,
+                 '-H', 'X-Peer-Auth: ' + auth, URL, timeout=16)
+
+
 def sync():
     ip, token = node_identity()
-    raw = https(URL, timeout=16)
+    raw = fetch_manifest(ip, token)
     if len(raw) > 65536:
         raise ValueError('manifest too large')
     envelope = json.loads(raw)
