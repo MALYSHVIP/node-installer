@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Replace the node's SSH destination allowlist without touching inbound SSH."""
+import ipaddress
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+PEERS = Path('/etc/remnanode/ssh-peers.allow')
+SELF = '/usr/local/sbin/remnanode-ssh-peers'
+TABLE = 'remnanode_ssh_peers'
+LEGACY = ('remnanode_outbound_ssh_guard', 'remnanode_spamhaus_egress_guard')
+RULE_MARK = 'remnanode-managed-ssh-peers'
+
+
+def run(*argv, input_text=None, check=True):
+    result = subprocess.run(argv, input=input_text, text=True,
+                            capture_output=True, check=False, timeout=45)
+    if check and result.returncode:
+        raise RuntimeError(f'{" ".join(argv[:3])}: {result.stderr.strip()}')
+    return result
+
+
+def normalize(raw):
+    if len(raw) > 32768:
+        raise ValueError('allowlist exceeds 32 KiB')
+    peers = set()
+    for line in raw.splitlines():
+        value = line.strip()
+        if not value:
+            continue
+        address = ipaddress.ip_address(value)
+        if not isinstance(address, ipaddress.IPv4Address):
+            raise ValueError('only IPv4 nodes are supported by this allowlist')
+        if not address.is_global:
+            raise ValueError(f'non-public address is not a node: {value}')
+        peers.add(str(address))
+    if len(peers) > 512:
+        raise ValueError('too many nodes')
+    return sorted(peers, key=lambda value: int(ipaddress.IPv4Address(value)))
+
+
+def write_atomic(path, data):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.ssh-peers.', dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w') as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def nft_batch(source):
+    fd, name = tempfile.mkstemp(prefix='remnanode-ssh-peers-', suffix='.nft')
+    try:
+        with os.fdopen(fd, 'w') as output:
+            output.write(source)
+        run('nft', '-c', '-f', name)
+        run('nft', '-f', name)
+    finally:
+        os.unlink(name)
+
+
+def table_exists(name):
+    return run('nft', 'list', 'table', 'inet', name, check=False).returncode == 0
+
+
+def refresh_peer_guard(peers):
+    prefix = f'delete table inet {TABLE}\n' if table_exists(TABLE) else ''
+    elements = 'elements = { ' + ', '.join(peers) + ' };' if peers else ''
+    nft_batch(prefix + f'''table inet {TABLE} {{
+    set allowed_v4 {{ type ipv4_addr; {elements} }}
+    chain output {{
+        type filter hook output priority -8; policy accept;
+        ct state established,related accept
+        ip daddr @allowed_v4 tcp dport 22 accept
+        tcp dport 22 reject with icmpx type admin-prohibited
+    }}
+    chain forward {{
+        type filter hook forward priority -8; policy accept;
+        tcp dport 22 reject with icmpx type admin-prohibited
+    }}
+}}
+''')
+
+
+def refresh_legacy(peers):
+    for table in LEGACY:
+        if not table_exists(table):
+            continue
+        if run('nft', 'list', 'set', 'inet', table, 'ssh_peer_v4',
+               check=False).returncode:
+            run('nft', 'add', 'set', 'inet', table, 'ssh_peer_v4',
+                '{ type ipv4_addr; }')
+        for chain in ('output',):
+            current = run('nft', 'list', 'chain', 'inet', table, chain).stdout
+            if RULE_MARK not in current:
+                run('nft', 'insert', 'rule', 'inet', table, chain,
+                    'ip', 'daddr', '@ssh_peer_v4', 'tcp', 'dport', '22',
+                    'accept', 'comment', RULE_MARK)
+        source = f'flush set inet {table} ssh_peer_v4\n'
+        if peers:
+            source += (f'add element inet {table} ssh_peer_v4 '
+                       + '{ ' + ', '.join(peers) + ' }\n')
+        nft_batch(source)
+
+
+def refresh(mode='all'):
+    peers = normalize(PEERS.read_text() if PEERS.exists() else '')
+    if mode == 'all':
+        refresh_peer_guard(peers)
+    refresh_legacy(peers)
+    print(f'APPLIED count={len(peers)}')
+
+
+def install_hooks():
+    service = Path('/etc/systemd/system/remnanode-ssh-peers.service')
+    service.write_text(f'''[Unit]
+Description=RemnaNode managed SSH destination allowlist
+After=network-online.target remnanode-outbound-ssh-guard.service remnanode-spamhaus-egress-guard.service
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart={SELF} refresh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+''')
+    for unit in ('remnanode-outbound-ssh-guard', 'remnanode-spamhaus-egress-guard'):
+        dropin = Path('/etc/systemd/system') / (unit + '.service.d/90-ssh-peers.conf')
+        dropin.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        dropin.write_text(f'[Service]\nExecStartPost={SELF} refresh-legacy\n')
+    run('systemctl', 'daemon-reload')
+    run('systemctl', 'enable', 'remnanode-ssh-peers.service')
+    refresh()
+
+
+def main():
+    if os.geteuid() != 0:
+        raise PermissionError('root is required')
+    action = sys.argv[1] if len(sys.argv) == 2 else ''
+    if action == 'install-hooks':
+        install_hooks()
+    elif action == 'refresh':
+        refresh()
+    elif action == 'refresh-legacy':
+        refresh('legacy')
+    elif action == 'apply':
+        peers = normalize(sys.stdin.read())
+        previous = PEERS.read_text() if PEERS.exists() else None
+        write_atomic(PEERS, ''.join(value + '\n' for value in peers))
+        try:
+            refresh()
+        except Exception:
+            if previous is None:
+                PEERS.unlink(missing_ok=True)
+            else:
+                write_atomic(PEERS, previous)
+            refresh()
+            raise
+    else:
+        raise ValueError('usage: remnanode-ssh-peers install-hooks|refresh|refresh-legacy|apply')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print('ERROR ' + str(error), file=sys.stderr)
+        sys.exit(1)

@@ -4,6 +4,7 @@ export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
+export INSTALLER_REPO INSTALLER_REF
 INSTALLER_FILE="${INSTALLER_FILE:-setup-remnanode.sh}"
 TMP_FILE=""
 LOCAL_INSTALLER_USED=0

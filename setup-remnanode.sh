@@ -13,7 +13,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.0.1"
+INSTALLER_VERSION="4.0.2"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -5137,7 +5137,8 @@ run_install() {
   configure_log_hygiene_and_maintenance
   write_firewall
   configure_antiabuse_guards
-  install_managed_ssh_peers
+  # SSH peer restrictions are applied only by the monitoring panel's explicit
+  # transfer action; never impose them on bots, panels, or exempt machines here.
   configure_xhttp_module
   install_rendered_files
   configure_xhttp_socket_guard
