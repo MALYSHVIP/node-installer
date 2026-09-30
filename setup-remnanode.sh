@@ -13,7 +13,9 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.0.0"
+INSTALLER_VERSION="4.0.1"
+INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
+INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
 DEFAULT_NODE_VERSION="3.4.1"
 PANEL_COMPAT_VERSION="3.4.x (panel must already be upgraded)"
@@ -49,6 +51,11 @@ SPAMHAUS_EGRESS_GUARD_SERVICE="/etc/systemd/system/remnanode-spamhaus-egress-gua
 SPAMHAUS_EGRESS_GUARD_TIMER="/etc/systemd/system/remnanode-spamhaus-egress-guard.timer"
 OUTBOUND_SSH_GUARD_SCRIPT="/usr/local/sbin/remnanode-outbound-ssh-guard.sh"
 OUTBOUND_SSH_GUARD_SERVICE="/etc/systemd/system/remnanode-outbound-ssh-guard.service"
+SSH_PEERS_SCRIPT="/usr/local/sbin/remnanode-ssh-peers"
+SSH_PEERS_FILE="/etc/remnanode/ssh-peers.allow"
+SSH_PEERS_SERVICE="/etc/systemd/system/remnanode-ssh-peers.service"
+SSH_PEERS_OUTBOUND_DROPIN="/etc/systemd/system/remnanode-outbound-ssh-guard.service.d/90-ssh-peers.conf"
+SSH_PEERS_SPAMHAUS_DROPIN="/etc/systemd/system/remnanode-spamhaus-egress-guard.service.d/90-ssh-peers.conf"
 DNS_REFLECTION_GUARD_SCRIPT="/usr/local/sbin/remnanode-dns-reflection-guard.sh"
 DNS_REFLECTION_GUARD_SERVICE="/etc/systemd/system/remnanode-dns-reflection-guard.service"
 BITTORRENT_GUARD_SCRIPT="/usr/local/sbin/remnanode-bittorrent-guard.sh"
@@ -1467,6 +1474,7 @@ remnanode-firewall.service
 remnanode-spamhaus-egress-guard.timer
 remnanode-spamhaus-egress-guard.service
 remnanode-outbound-ssh-guard.service
+remnanode-ssh-peers.service
 remnanode-dns-reflection-guard.service
 remnanode-bittorrent-guard.service
 docker.service
@@ -1497,6 +1505,8 @@ backup_system_paths() {
     "$QUIC_RUNTIME_SCRIPT" "$QUIC_RUNTIME_SERVICE" \
     "$SPAMHAUS_EGRESS_GUARD_SCRIPT" "$SPAMHAUS_EGRESS_GUARD_SERVICE" "$SPAMHAUS_EGRESS_GUARD_TIMER" \
     "$OUTBOUND_SSH_GUARD_SCRIPT" "$OUTBOUND_SSH_GUARD_SERVICE" \
+    "$SSH_PEERS_SCRIPT" "$SSH_PEERS_FILE" "$SSH_PEERS_SERVICE" \
+    "$SSH_PEERS_OUTBOUND_DROPIN" "$SSH_PEERS_SPAMHAUS_DROPIN" \
     "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" \
     "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" \
     "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" "$TLS_DIR" "$PANEL_IPS_FILE" \
@@ -1709,6 +1719,8 @@ remove_known_current_files_for_rollback() {
     "$QUIC_RUNTIME_SCRIPT" "$QUIC_RUNTIME_SERVICE" \
     "$SPAMHAUS_EGRESS_GUARD_SCRIPT" "$SPAMHAUS_EGRESS_GUARD_SERVICE" "$SPAMHAUS_EGRESS_GUARD_TIMER" \
     "$OUTBOUND_SSH_GUARD_SCRIPT" "$OUTBOUND_SSH_GUARD_SERVICE" \
+    "$SSH_PEERS_SCRIPT" "$SSH_PEERS_FILE" "$SSH_PEERS_SERVICE" \
+    "$SSH_PEERS_OUTBOUND_DROPIN" "$SSH_PEERS_SPAMHAUS_DROPIN" \
     "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" \
     "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" \
     "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" /etc/nginx/conf.d/00-remnanode-hash-tuning.conf
@@ -1937,11 +1949,12 @@ rollback_from_backup() {
   systemctl stop remnanode-xhttp-socket-guard.service >/dev/null 2>&1 || true
   systemctl disable --now remnanode-quic-runtime.service >/dev/null 2>&1 || true
   for unit in remnanode-spamhaus-egress-guard.timer remnanode-spamhaus-egress-guard.service \
-    remnanode-outbound-ssh-guard.service remnanode-dns-reflection-guard.service remnanode-bittorrent-guard.service; do
+    remnanode-outbound-ssh-guard.service remnanode-ssh-peers.service \
+    remnanode-dns-reflection-guard.service remnanode-bittorrent-guard.service; do
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
   done
   for unit in remnanode_spamhaus_egress_guard remnanode_outbound_ssh_guard \
-    remnanode_dns_reflection_guard remnanode_bittorrent_guard; do
+    remnanode_ssh_peers remnanode_dns_reflection_guard remnanode_bittorrent_guard; do
     nft delete table inet "$unit" >/dev/null 2>&1 || true
   done
   remove_bittorrent_string_runtime
@@ -3560,6 +3573,22 @@ configure_antiabuse_guards() {
   fi
 }
 
+install_managed_ssh_peers() {
+  local source_file="" source_url=""
+  source_file="$(mktemp /tmp/remnanode-ssh-peers.XXXXXX)"
+  source_url="https://raw.githubusercontent.com/${INSTALLER_REPO}/${INSTALLER_REF}/bin/remnanode-ssh-peers"
+  if [[ -f "$(dirname "${BASH_SOURCE[0]}")/bin/remnanode-ssh-peers" ]]; then
+    cp "$(dirname "${BASH_SOURCE[0]}")/bin/remnanode-ssh-peers" "$source_file"
+  else
+    curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --retry 4 \
+      "$source_url" -o "$source_file"
+  fi
+  python3 -m py_compile "$source_file"
+  install -m 0700 -o root -g root "$source_file" /usr/local/sbin/remnanode-ssh-peers
+  rm -f "$source_file"
+  /usr/local/sbin/remnanode-ssh-peers install-hooks
+}
+
 check_xhttp_port_conflicts() {
   local line=""
   command -v ss >/dev/null 2>&1 || return 0
@@ -4017,8 +4046,8 @@ $ipv6_https
     ssl_session_timeout 1d;
     ssl_session_tickets off;
     client_header_timeout 5m;
-    keepalive_timeout 5m;
-    keepalive_requests 10000;
+    keepalive_timeout 75s;
+    keepalive_requests 1000;
     reset_timedout_connection on;
 
     location = / {
@@ -5108,6 +5137,7 @@ run_install() {
   configure_log_hygiene_and_maintenance
   write_firewall
   configure_antiabuse_guards
+  install_managed_ssh_peers
   configure_xhttp_module
   install_rendered_files
   configure_xhttp_socket_guard
