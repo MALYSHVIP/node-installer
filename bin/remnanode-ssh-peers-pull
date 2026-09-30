@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Pull and verify a signed SSH peer list. Never accepts an unsigned update."""
+import base64
+import hashlib
+import hmac
+import ipaddress
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+
+URL = 'https://api.chernakovgame.ru/api/ssh-peers/manifest.json'
+ACK_URL = 'https://api.chernakovgame.ru/api/ssh-peers/ack.php'
+PUBLIC_KEY = Path('/etc/remnanode/ssh-peers-signing.pub')
+PUBLIC_KEY_SHA256 = '0e2d38540c5c693a8ce4d2c5a39bafa8089c5b06d03caa309a1e4a250660cba9'
+PUBLIC_KEY_PEM = (b'-----BEGIN PUBLIC KEY-----\n'
+                  b'MCowBQYDK2VwAyEAuDTRVitFGs72JHDU0mPqo1JQ4oVmHmDw+lOo++GxRGg=\n'
+                  b'-----END PUBLIC KEY-----\n')
+TOKEN_FILE = Path('/etc/remnanode/ssh-peers-token')
+NODE_IP_FILE = Path('/etc/remnanode/ssh-peers-node-ip')
+STATE_FILE = Path('/var/lib/remnanode/ssh-peers-pull-state.json')
+APPLIER = '/usr/local/sbin/remnanode-ssh-peers'
+MASTER_APPLIER = '/usr/local/sbin/master-ssh-peers'
+MASTER_MODE = Path('/etc/monitor-ssh-peers/master-mode')
+
+
+def run(*args, input_bytes=None, timeout=35):
+    result = subprocess.run(args, input=input_bytes, capture_output=True,
+                            timeout=timeout, check=False)
+    if result.returncode:
+        raise RuntimeError((result.stderr.decode(errors='replace').strip() or
+                            'command failed')[-300:])
+    return result.stdout
+
+
+def https(*args, input_bytes=None, timeout=16):
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            return run('curl', '-4', '-fsS', '--proto', '=https',
+                       '--connect-timeout', '7', '--max-time', '12',
+                       *args, input_bytes=input_bytes, timeout=timeout)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            last_error = error
+            if attempt < 3:
+                time.sleep(attempt * 2)
+    raise RuntimeError('HTTPS failed after 3 attempts: ' + str(last_error))
+
+
+def atomic_write(path, value, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'wb') as output:
+            output.write(value)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def node_identity():
+    ip = NODE_IP_FILE.read_text().strip()
+    address = ipaddress.ip_address(ip)
+    if not isinstance(address, ipaddress.IPv4Address) or not address.is_global:
+        raise ValueError('invalid node IP')
+    token = bytes.fromhex(TOKEN_FILE.read_text().strip())
+    if len(token) != 32:
+        raise ValueError('invalid node token')
+    return ip, token
+
+
+def verify_signature(payload, signature):
+    if hashlib.sha256(PUBLIC_KEY.read_bytes()).hexdigest() != PUBLIC_KEY_SHA256:
+        raise ValueError('untrusted signing public key')
+    canonical = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
+    sig = base64.b64decode(signature, validate=True)
+    if len(sig) != 64:
+        raise ValueError('invalid signature length')
+    with tempfile.TemporaryDirectory(prefix='ssh-peers-verify-') as directory:
+        body_path = Path(directory) / 'payload'
+        sig_path = Path(directory) / 'signature'
+        body_path.write_bytes(canonical)
+        sig_path.write_bytes(sig)
+        run('openssl', 'pkeyutl', '-verify', '-pubin', '-inkey',
+            str(PUBLIC_KEY), '-rawin', '-in', str(body_path),
+            '-sigfile', str(sig_path), timeout=15)
+    return canonical
+
+
+def validate_payload(payload, node_ip):
+    if not isinstance(payload, dict) or payload.get('version') != 1:
+        raise ValueError('unsupported manifest version')
+    for name in ('generation', 'issued_at', 'expires_at'):
+        if type(payload.get(name)) is not int or payload[name] < 1:
+            raise ValueError('invalid ' + name)
+    now = int(time.time())
+    if payload['issued_at'] > now + 300 or payload['expires_at'] <= now:
+        raise ValueError('manifest not valid at current time')
+    if payload['expires_at'] - payload['issued_at'] > 31 * 86400:
+        raise ValueError('manifest lifetime too long')
+    peers = payload.get('peers')
+    if not isinstance(peers, list) or not 2 <= len(peers) <= 512:
+        raise ValueError('invalid peers list')
+    normalized = set()
+    for value in peers:
+        if not isinstance(value, str):
+            raise ValueError('invalid peer')
+        address = ipaddress.ip_address(value)
+        if not isinstance(address, ipaddress.IPv4Address) or not address.is_global:
+            raise ValueError('non-public peer')
+        normalized.add(str(address))
+    if len(normalized) != len(peers) or normalized != set(peers):
+        raise ValueError('duplicate or non-canonical peers')
+    if node_ip not in normalized:
+        raise ValueError('this node is not in the signed peer list')
+    return sorted(normalized, key=lambda item: int(ipaddress.IPv4Address(item)))
+
+
+def send_ack(ip, token, generation, digest, status):
+    body = json.dumps({'ip': ip, 'generation': generation,
+                       'digest': digest, 'status': status},
+                      sort_keys=True, separators=(',', ':')).encode()
+    auth = hmac.new(token, body, hashlib.sha256).hexdigest()
+    https('-H', 'Content-Type: application/json',
+          '-H', 'X-Peer-Auth: ' + auth, '--data-binary', '@-',
+          ACK_URL, input_bytes=body, timeout=16)
+
+
+def sync():
+    ip, token = node_identity()
+    raw = https(URL, timeout=16)
+    if len(raw) > 65536:
+        raise ValueError('manifest too large')
+    envelope = json.loads(raw)
+    if not isinstance(envelope, dict) or not isinstance(envelope.get('signature'), str):
+        raise ValueError('invalid manifest envelope')
+    payload = envelope.get('payload')
+    canonical = verify_signature(payload, envelope['signature'])
+    peers = validate_payload(payload, ip)
+    digest = hashlib.sha256(canonical).hexdigest()
+    old = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    generation = payload['generation']
+    if generation < int(old.get('generation', 0)):
+        raise ValueError('manifest rollback detected')
+    if generation == old.get('generation') and digest != old.get('digest'):
+        raise ValueError('generation collision')
+    if generation > int(old.get('generation', 0)):
+        peer_text = ''.join(value + '\n' for value in peers).encode()
+        applier = MASTER_APPLIER if MASTER_MODE.exists() else APPLIER
+        try:
+            run(applier, 'apply', input_bytes=peer_text, timeout=40)
+            if not MASTER_MODE.exists():
+                run(APPLIER, 'install-hooks', timeout=40)
+        except Exception:
+            send_ack(ip, token, generation, digest, 'error')
+            raise
+        atomic_write(STATE_FILE, json.dumps({'generation': generation,
+                                             'digest': digest}).encode())
+        print(f'APPLIED generation={generation} peers={len(peers)}')
+    send_ack(ip, token, generation, digest, 'applied')
+
+
+def install_hooks():
+    if not PUBLIC_KEY.exists():
+        atomic_write(PUBLIC_KEY, PUBLIC_KEY_PEM, 0o644)
+    if hashlib.sha256(PUBLIC_KEY.read_bytes()).hexdigest() != PUBLIC_KEY_SHA256:
+        raise ValueError('untrusted signing public key')
+    if not TOKEN_FILE.exists() or not NODE_IP_FILE.exists():
+        raise ValueError('node token and IP must be provisioned before enabling pull')
+    service = Path('/etc/systemd/system/remnanode-ssh-peers-pull.service')
+    timer = Path('/etc/systemd/system/remnanode-ssh-peers-pull.timer')
+    service.write_text('''[Unit]
+Description=Pull and verify signed SSH peer list
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/remnanode-ssh-peers-pull sync
+''')
+    timer.write_text('''[Unit]
+Description=Regular signed SSH peer list retrieval
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=30s
+RandomizedDelaySec=3s
+Unit=remnanode-ssh-peers-pull.service
+
+[Install]
+WantedBy=timers.target
+''')
+    run('systemctl', 'daemon-reload')
+    run('systemctl', 'enable', '--now', 'remnanode-ssh-peers-pull.timer')
+
+
+def main():
+    if os.geteuid():
+        raise PermissionError('root required')
+    if len(sys.argv) != 2:
+        raise ValueError('usage: remnanode-ssh-peers-pull sync|install-hooks')
+    if sys.argv[1] == 'sync':
+        sync()
+    elif sys.argv[1] == 'install-hooks':
+        install_hooks()
+    else:
+        raise ValueError('unknown action')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print('ERROR ' + str(error), file=sys.stderr)
+        sys.exit(1)

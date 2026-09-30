@@ -13,7 +13,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.0.2"
+INSTALLER_VERSION="4.0.3"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -56,6 +56,12 @@ SSH_PEERS_FILE="/etc/remnanode/ssh-peers.allow"
 SSH_PEERS_SERVICE="/etc/systemd/system/remnanode-ssh-peers.service"
 SSH_PEERS_OUTBOUND_DROPIN="/etc/systemd/system/remnanode-outbound-ssh-guard.service.d/90-ssh-peers.conf"
 SSH_PEERS_SPAMHAUS_DROPIN="/etc/systemd/system/remnanode-spamhaus-egress-guard.service.d/90-ssh-peers.conf"
+SSH_PEERS_PULL_SCRIPT="/usr/local/sbin/remnanode-ssh-peers-pull"
+SSH_PEERS_PULL_SERVICE="/etc/systemd/system/remnanode-ssh-peers-pull.service"
+SSH_PEERS_PULL_TIMER="/etc/systemd/system/remnanode-ssh-peers-pull.timer"
+SSH_PEERS_PUBLIC_KEY="/etc/remnanode/ssh-peers-signing.pub"
+SSH_PEERS_TOKEN="/etc/remnanode/ssh-peers-token"
+SSH_PEERS_NODE_IP="/etc/remnanode/ssh-peers-node-ip"
 DNS_REFLECTION_GUARD_SCRIPT="/usr/local/sbin/remnanode-dns-reflection-guard.sh"
 DNS_REFLECTION_GUARD_SERVICE="/etc/systemd/system/remnanode-dns-reflection-guard.service"
 BITTORRENT_GUARD_SCRIPT="/usr/local/sbin/remnanode-bittorrent-guard.sh"
@@ -1507,6 +1513,8 @@ backup_system_paths() {
     "$OUTBOUND_SSH_GUARD_SCRIPT" "$OUTBOUND_SSH_GUARD_SERVICE" \
     "$SSH_PEERS_SCRIPT" "$SSH_PEERS_FILE" "$SSH_PEERS_SERVICE" \
     "$SSH_PEERS_OUTBOUND_DROPIN" "$SSH_PEERS_SPAMHAUS_DROPIN" \
+    "$SSH_PEERS_PULL_SCRIPT" "$SSH_PEERS_PULL_SERVICE" "$SSH_PEERS_PULL_TIMER" \
+    "$SSH_PEERS_PUBLIC_KEY" "$SSH_PEERS_TOKEN" "$SSH_PEERS_NODE_IP" \
     "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" \
     "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" \
     "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" "$TLS_DIR" "$PANEL_IPS_FILE" \
@@ -1721,6 +1729,8 @@ remove_known_current_files_for_rollback() {
     "$OUTBOUND_SSH_GUARD_SCRIPT" "$OUTBOUND_SSH_GUARD_SERVICE" \
     "$SSH_PEERS_SCRIPT" "$SSH_PEERS_FILE" "$SSH_PEERS_SERVICE" \
     "$SSH_PEERS_OUTBOUND_DROPIN" "$SSH_PEERS_SPAMHAUS_DROPIN" \
+    "$SSH_PEERS_PULL_SCRIPT" "$SSH_PEERS_PULL_SERVICE" "$SSH_PEERS_PULL_TIMER" \
+    "$SSH_PEERS_PUBLIC_KEY" "$SSH_PEERS_TOKEN" "$SSH_PEERS_NODE_IP" \
     "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" \
     "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" \
     "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" /etc/nginx/conf.d/00-remnanode-hash-tuning.conf
@@ -1948,6 +1958,7 @@ rollback_from_backup() {
   systemctl disable --now remnanode-xhttp-socket-guard.timer >/dev/null 2>&1 || true
   systemctl stop remnanode-xhttp-socket-guard.service >/dev/null 2>&1 || true
   systemctl disable --now remnanode-quic-runtime.service >/dev/null 2>&1 || true
+  systemctl disable --now remnanode-ssh-peers-pull.timer >/dev/null 2>&1 || true
   for unit in remnanode-spamhaus-egress-guard.timer remnanode-spamhaus-egress-guard.service \
     remnanode-outbound-ssh-guard.service remnanode-ssh-peers.service \
     remnanode-dns-reflection-guard.service remnanode-bittorrent-guard.service; do
@@ -3573,7 +3584,7 @@ configure_antiabuse_guards() {
   fi
 }
 
-install_managed_ssh_peers() {
+install_ssh_peers_pull_module() {
   local source_file="" source_url=""
   source_file="$(mktemp /tmp/remnanode-ssh-peers.XXXXXX)"
   source_url="https://raw.githubusercontent.com/${INSTALLER_REPO}/${INSTALLER_REF}/bin/remnanode-ssh-peers"
@@ -3586,7 +3597,24 @@ install_managed_ssh_peers() {
   python3 -m py_compile "$source_file"
   install -m 0700 -o root -g root "$source_file" /usr/local/sbin/remnanode-ssh-peers
   rm -f "$source_file"
-  /usr/local/sbin/remnanode-ssh-peers install-hooks
+
+  source_file="$(mktemp /tmp/remnanode-ssh-peers-pull.XXXXXX)"
+  source_url="https://raw.githubusercontent.com/${INSTALLER_REPO}/${INSTALLER_REF}/bin/remnanode-ssh-peers-pull"
+  if [[ -f "$(dirname "${BASH_SOURCE[0]}")/bin/remnanode-ssh-peers-pull" ]]; then
+    cp "$(dirname "${BASH_SOURCE[0]}")/bin/remnanode-ssh-peers-pull" "$source_file"
+  else
+    curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --retry 4 \
+      "$source_url" -o "$source_file"
+  fi
+  python3 -m py_compile "$source_file"
+  install -m 0700 -o root -g root "$source_file" "$SSH_PEERS_PULL_SCRIPT"
+  rm -f "$source_file"
+  if [[ -s "$SSH_PEERS_TOKEN" && -s "$SSH_PEERS_NODE_IP" ]]; then
+    "$SSH_PEERS_PULL_SCRIPT" install-hooks
+    log "HTTPS-получатель списка IP активирован."
+  else
+    log "HTTPS-получатель списка IP установлен; ожидание индивидуального токена ноды."
+  fi
 }
 
 check_xhttp_port_conflicts() {
@@ -5137,8 +5165,9 @@ run_install() {
   configure_log_hygiene_and_maintenance
   write_firewall
   configure_antiabuse_guards
-  # SSH peer restrictions are applied only by the monitoring panel's explicit
-  # transfer action; never impose them on bots, panels, or exempt machines here.
+  # The receiver stays inactive until this node has an individual token.
+  # The monitoring panel never logs into nodes to transfer the IP list.
+  install_ssh_peers_pull_module
   configure_xhttp_module
   install_rendered_files
   configure_xhttp_socket_guard
