@@ -13,7 +13,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.0.5"
+INSTALLER_VERSION="4.0.6"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -398,9 +398,8 @@ ask_secret() {
 }
 
 usage() {
+  printf 'RemnaNode installer %s for Panel 3.4.x / Node %s\n\n' "$INSTALLER_VERSION" "$DEFAULT_NODE_VERSION"
   cat <<'EOF'
-RemnaNode installer 4.0.5 for Panel 3.4.x / Node 3.4.1
-
 Usage:
   setup-remnanode.sh [install|update|repair|status|logs|xray-logs|rollback] [options]
 
@@ -691,6 +690,7 @@ acquire_lock() {
     die "Lock занят, но безопасно определить предыдущий installer не удалось. Проверьте: fuser -v $LOCK_FILE"
 
   warn "Останавливаю предыдущий installer (PID $owner_pid) и жду завершения rollback до ${INSTALLER_REPLACE_TIMEOUT}s."
+  resume_stopped_installer_lock_holders "$owner_pid"
   kill -TERM "$owner_pid" 2>/dev/null || true
 
   exec 9>"$LOCK_FILE"
@@ -768,6 +768,44 @@ find_previous_installer_pid() {
     return 0
   done < <(lock_holder_pids)
   return 1
+}
+
+is_descendant_or_self() {
+  local pid="$1"
+  local ancestor="$2"
+  local parent=""
+
+  while [[ "$pid" =~ ^[0-9]+$ && "$pid" != "0" ]]; do
+    [[ "$pid" == "$ancestor" ]] && return 0
+    [[ -r "/proc/$pid/status" ]] || return 1
+    parent="$(awk '$1 == "PPid:" { print $2; exit }' "/proc/$pid/status" 2>/dev/null || true)"
+    [[ "$parent" =~ ^[0-9]+$ && "$parent" != "$pid" ]] || return 1
+    pid="$parent"
+  done
+  return 1
+}
+
+resume_stopped_installer_lock_holders() {
+  local owner_pid="$1"
+  local holder_pid=""
+  local state=""
+  local -a stopped_pids=()
+
+  # A suspended installer cannot handle TERM or run its rollback trap. Its
+  # children may inherit the lock fd and be suspended too. Never resume a
+  # process outside the verified old installer's tree or its whole job group.
+  while IFS= read -r holder_pid; do
+    [[ -d "/proc/$holder_pid" ]] || continue
+    is_descendant_or_self "$holder_pid" "$owner_pid" || \
+      die "Lock удерживает PID $holder_pid вне дерева предыдущего installer; автоматическое замещение отменено."
+    state="$(awk '$1 == "State:" { print $2; exit }' "/proc/$holder_pid/status" 2>/dev/null || true)"
+    [[ "$state" == T || "$state" == t ]] && stopped_pids+=("$holder_pid")
+  done < <(lock_holder_pids)
+
+  for holder_pid in "${stopped_pids[@]}"; do
+    warn "Возобновляю остановленный процесс предыдущего installer (PID $holder_pid) для безопасного завершения."
+    kill -CONT "$holder_pid" 2>/dev/null || true
+  done
 }
 
 mark_lock_owner() {
