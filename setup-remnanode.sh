@@ -13,7 +13,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.0.4"
+INSTALLER_VERSION="4.0.5"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -30,6 +30,7 @@ STATE_DIR="/var/lib/remnanode-installer"
 STATE_FILE="$STATE_DIR/state.env"
 BACKUP_ROOT="/var/backups/remnanode"
 LOCK_FILE="/run/lock/remnanode-installer.lock"
+LOCK_PID_FILE="/run/lock/remnanode-installer.pid"
 
 SYSCTL_FILE="/etc/sysctl.d/99-remnanode.conf"
 LOGROTATE_FILE="/etc/logrotate.d/remnanode"
@@ -161,6 +162,7 @@ ALLOW_CUSTOM_IMAGE="${ALLOW_CUSTOM_IMAGE:-0}"
 RUN_SYSTEM_UPGRADE="${RUN_SYSTEM_UPGRADE:-0}"
 STABILITY_SECONDS="${STABILITY_SECONDS:-30}"
 APT_LOCK_TIMEOUT="${APT_LOCK_TIMEOUT:-600}"
+INSTALLER_REPLACE_TIMEOUT="${INSTALLER_REPLACE_TIMEOUT:-90}"
 
 PANEL_IPS=""
 XHTTP_DOMAIN=""
@@ -175,6 +177,7 @@ BACKUP_DIR=""
 PROMPT_VALUE=""
 PROMPT_FD=""
 PROMPT_FD_OWNED=0
+LOCK_ACQUIRED=0
 MUTATION_STARTED=0
 ROLLBACK_RUNNING=0
 INSTALL_CHANGED=0
@@ -396,7 +399,7 @@ ask_secret() {
 
 usage() {
   cat <<'EOF'
-RemnaNode installer 4.0.4 for Panel 3.4.x / Node 3.4.1
+RemnaNode installer 4.0.5 for Panel 3.4.x / Node 3.4.1
 
 Usage:
   setup-remnanode.sh [install|update|repair|status|logs|xray-logs|rollback] [options]
@@ -669,11 +672,123 @@ require_root() {
 }
 
 acquire_lock() {
+  local owner_pid=""
+
   command -v flock >/dev/null 2>&1 || \
     die "Нужен flock из пакета util-linux (apt-get install util-linux)."
+  [[ "$INSTALLER_REPLACE_TIMEOUT" =~ ^[0-9]+$ ]] && (( INSTALLER_REPLACE_TIMEOUT >= 10 )) || \
+    die "INSTALLER_REPLACE_TIMEOUT должен быть целым числом не меньше 10 секунд."
   install -d -m 0755 "$(dirname "$LOCK_FILE")"
   exec 9>"$LOCK_FILE"
-  flock -n 9 || die "Другой экземпляр installer уже запущен."
+  if flock -n 9; then
+    mark_lock_owner
+    return 0
+  fi
+  exec 9>&-
+
+  owner_pid="$(find_previous_installer_pid || true)"
+  [[ -n "$owner_pid" ]] || \
+    die "Lock занят, но безопасно определить предыдущий installer не удалось. Проверьте: fuser -v $LOCK_FILE"
+
+  warn "Останавливаю предыдущий installer (PID $owner_pid) и жду завершения rollback до ${INSTALLER_REPLACE_TIMEOUT}s."
+  kill -TERM "$owner_pid" 2>/dev/null || true
+
+  exec 9>"$LOCK_FILE"
+  flock -w "$INSTALLER_REPLACE_TIMEOUT" 9 || \
+    die "Предыдущий installer не завершил безопасный rollback за ${INSTALLER_REPLACE_TIMEOUT}s. Новый запуск не начат, чтобы не повредить ноду."
+  mark_lock_owner
+  log "Предыдущий installer остановлен; новый запуск продолжен."
+}
+
+lock_holder_pids() {
+  local fd=""
+  local pid=""
+  local target=""
+  local seen=" "
+  local fuser_output=""
+
+  if [[ -r "$LOCK_PID_FILE" ]]; then
+    pid="$(tr -dc '0-9' <"$LOCK_PID_FILE")"
+    if [[ -n "$pid" ]]; then
+      for fd in /proc/"$pid"/fd/*; do
+        [[ -e "$fd" ]] || continue
+        target="$(readlink -f "$fd" 2>/dev/null || true)"
+        [[ "$target" == "$LOCK_FILE" ]] || continue
+        printf '%s\n' "$pid"
+        seen+="$pid "
+        break
+      done
+    fi
+  fi
+
+  if command -v fuser >/dev/null 2>&1; then
+    fuser_output="$(fuser "$LOCK_FILE" 2>/dev/null || true)"
+    for pid in $fuser_output; do
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      case "$seen" in
+        *" $pid "*) ;;
+        *) printf '%s\n' "$pid"; seen+="$pid " ;;
+      esac
+    done
+    return 0
+  fi
+
+  for fd in /proc/[0-9]*/fd/*; do
+    [[ -e "$fd" ]] || continue
+    target="$(readlink -f "$fd" 2>/dev/null || true)"
+    [[ "$target" == "$LOCK_FILE" ]] || continue
+    pid="${fd#/proc/}"
+    pid="${pid%%/*}"
+    case "$seen" in
+      *" $pid "*) ;;
+      *) printf '%s\n' "$pid"; seen+="$pid " ;;
+    esac
+  done
+}
+
+is_installer_process() {
+  local pid="$1"
+  local cmdline=""
+
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$BASHPID" && "$pid" != "$$" ]] || return 1
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  [[ "$(stat -c %u "/proc/$pid" 2>/dev/null || printf 1)" == "0" ]] || return 1
+  cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  case "$cmdline" in
+    *setup-remnanode.sh*|*'/tmp/node-installer.'*.sh*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+find_previous_installer_pid() {
+  local pid=""
+  while IFS= read -r pid; do
+    is_installer_process "$pid" || continue
+    printf '%s' "$pid"
+    return 0
+  done < <(lock_holder_pids)
+  return 1
+}
+
+mark_lock_owner() {
+  local tmp=""
+  tmp="$(mktemp "${LOCK_PID_FILE}.XXXXXX")"
+  printf '%s\n' "$BASHPID" >"$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$LOCK_PID_FILE"
+  LOCK_ACQUIRED=1
+}
+
+release_installer_lock() {
+  local recorded=""
+  [[ "$LOCK_ACQUIRED" == "1" ]] || return 0
+  if [[ -r "$LOCK_PID_FILE" ]]; then
+    recorded="$(tr -dc '0-9' <"$LOCK_PID_FILE")"
+    [[ "$recorded" != "$BASHPID" ]] || rm -f "$LOCK_PID_FILE"
+  fi
+  flock -u 9 2>/dev/null || true
+  exec 9>&- 2>/dev/null || true
+  LOCK_ACQUIRED=0
 }
 
 version_ge() {
@@ -2210,6 +2325,7 @@ on_error() {
 cleanup_stage() {
   [[ "$BASHPID" == "$INSTALLER_MAIN_BASHPID" ]] || return 0
   close_prompt_input
+  release_installer_lock
   [[ -z "$STAGE_DIR" || ! -d "$STAGE_DIR" ]] || rm -rf "$STAGE_DIR"
   [[ -z "$SECRET_CHECK_DIR" || ! -d "$SECRET_CHECK_DIR" ]] || rm -rf "$SECRET_CHECK_DIR"
   [[ -z "$ROLLBACK_STAGE_DIR" || ! -d "$ROLLBACK_STAGE_DIR" ]] || rm -rf "$ROLLBACK_STAGE_DIR"
