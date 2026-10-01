@@ -13,7 +13,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.0.3"
+INSTALLER_VERSION="4.0.4"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -172,6 +172,9 @@ SECRET_CHECK_DIR=""
 ROLLBACK_STAGE_DIR=""
 BACKUP_STAGE_DIR=""
 BACKUP_DIR=""
+PROMPT_VALUE=""
+PROMPT_FD=""
+PROMPT_FD_OWNED=0
 MUTATION_STARTED=0
 ROLLBACK_RUNNING=0
 INSTALL_CHANGED=0
@@ -347,37 +350,53 @@ prepare_package_network() {
   return 1
 }
 
+open_prompt_input() {
+  [[ -n "$PROMPT_FD" ]] && return 0
+
+  if [[ -t 0 ]]; then
+    PROMPT_FD=0
+    return 0
+  fi
+
+  # `curl ... | bash` consumes stdin with the bootstrap script. Use the
+  # controlling terminal for all subsequent answers instead of the pipe.
+  if { exec {PROMPT_FD}</dev/tty; } 2>/dev/null; then
+    PROMPT_FD_OWNED=1
+    return 0
+  fi
+
+  return 1
+}
+
+close_prompt_input() {
+  if [[ "$PROMPT_FD_OWNED" == "1" && -n "$PROMPT_FD" ]]; then
+    exec {PROMPT_FD}<&-
+  fi
+  PROMPT_FD=""
+  PROMPT_FD_OWNED=0
+}
+
 ask() {
   local prompt="$1"
   local value=""
-  local tty_fd="" rc=0
-  # /dev/tty may exist but be unopenable in cloud-init or a detached session.
-  if { exec {tty_fd}</dev/tty; } 2>/dev/null; then
-    read -r -p "$prompt" value <&"$tty_fd" || rc=$?
-    exec {tty_fd}<&-
-  else
-    read -r -p "$prompt" value || rc=$?
+
+  open_prompt_input || die "Интерактивный ввод недоступен. Запустите команду из обычного SSH-терминала либо передайте параметры через PANEL_IP/PANEL_IPS, XHTTP_DOMAIN и SECRET_FILE."
+  # Print explicitly to stderr. `read -p` can hide a prompt when the caller
+  # captures stdout, which makes a working installer look frozen.
+  printf '%s' "$prompt" >&2
+  if ! IFS= read -r -u "$PROMPT_FD" value; then
+    die "Ввод прерван на запросе: $prompt"
   fi
-  (( rc == 0 )) || return "$rc"
-  printf '%s' "$value"
+  PROMPT_VALUE="$value"
 }
 
 ask_secret() {
-  local value=""
-  local tty_fd="" rc=0
-  if { exec {tty_fd}</dev/tty; } 2>/dev/null; then
-    read -r -p "SECRET_KEY из карточки ноды (ввод отображается): " value <&"$tty_fd" || rc=$?
-    exec {tty_fd}<&-
-  else
-    read -r -p "SECRET_KEY из карточки ноды (ввод отображается): " value || rc=$?
-  fi
-  (( rc == 0 )) || return "$rc"
-  printf '%s' "$value"
+  ask "SECRET_KEY из карточки ноды (ввод отображается): "
 }
 
 usage() {
   cat <<'EOF'
-RemnaNode installer 4.0.0 for Panel 3.4.x / Node 3.4.1
+RemnaNode installer 4.0.4 for Panel 3.4.x / Node 3.4.1
 
 Usage:
   setup-remnanode.sh [install|update|repair|status|logs|xray-logs|rollback] [options]
@@ -1112,7 +1131,8 @@ collect_inputs() {
   fi
   if [[ -z "$PANEL_IPS" ]]; then
     bool_true "$YES" && die "В non-interactive режиме нужен PANEL_IP/PANEL_IPS."
-    PANEL_IPS="$(normalize_panel_ips "$(ask 'IP или CIDR мастер-панели: ')")"
+    ask 'IP или CIDR мастер-панели: '
+    PANEL_IPS="$(normalize_panel_ips "$PROMPT_VALUE")"
   fi
   validate_panel_ips_basic
 
@@ -1122,7 +1142,8 @@ collect_inputs() {
     elif bool_true "$YES"; then
       ENABLE_XHTTP=0
     else
-      answer="$(ask 'Настроить xHTTP через Nginx/TLS? [y/N]: ' || true)"
+      ask 'Настроить xHTTP через Nginx/TLS? [y/N]: '
+      answer="$PROMPT_VALUE"
       bool_true "$answer" && ENABLE_XHTTP=1 || ENABLE_XHTTP=0
     fi
   fi
@@ -1131,7 +1152,8 @@ collect_inputs() {
     XHTTP_DOMAIN="$(normalize_domain "$XHTTP_DOMAIN_INPUT")"
     if [[ -z "$XHTTP_DOMAIN" ]]; then
       bool_true "$YES" && die "Для xHTTP нужен XHTTP_DOMAIN."
-      XHTTP_DOMAIN="$(normalize_domain "$(ask 'Домен xHTTP: ')")"
+      ask 'Домен xHTTP: '
+      XHTTP_DOMAIN="$(normalize_domain "$PROMPT_VALUE")"
     fi
     validate_xhttp
     if ! port_in_csv 80 "$PUBLIC_TCP_PORTS"; then
@@ -1163,7 +1185,8 @@ collect_inputs() {
   detect_existing_secret
   if [[ -z "$SECRET_VALUE" ]]; then
     bool_true "$YES" && die "В non-interactive режиме нужен SECRET_FILE или SECRET_KEY."
-    SECRET_VALUE="$(ask_secret)"
+    ask_secret
+    SECRET_VALUE="$PROMPT_VALUE"
   fi
   validate_secret_basic
   validate_settings
@@ -2186,6 +2209,7 @@ on_error() {
 
 cleanup_stage() {
   [[ "$BASHPID" == "$INSTALLER_MAIN_BASHPID" ]] || return 0
+  close_prompt_input
   [[ -z "$STAGE_DIR" || ! -d "$STAGE_DIR" ]] || rm -rf "$STAGE_DIR"
   [[ -z "$SECRET_CHECK_DIR" || ! -d "$SECRET_CHECK_DIR" ]] || rm -rf "$SECRET_CHECK_DIR"
   [[ -z "$ROLLBACK_STAGE_DIR" || ! -d "$ROLLBACK_STAGE_DIR" ]] || rm -rf "$ROLLBACK_STAGE_DIR"
@@ -5142,7 +5166,8 @@ run_install() {
   fi
 
   if ! bool_true "$YES"; then
-    bool_true "$(ask 'Применить этот план? Краткий перезапуск ноды прервёт подключения. [y/N]: ' || true)" || {
+    ask 'Применить этот план? Краткий перезапуск ноды прервёт подключения. [y/N]: '
+    bool_true "$PROMPT_VALUE" || {
       log "Отменено: изменений нет."
       return 0
     }
