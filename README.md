@@ -8,9 +8,15 @@
 curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | sudo bash
 ```
 
+Если IP мастер-панели уже известен, поддерживается ровно такой однострочный запуск; остальные значения установщик запросит в терминале:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | sudo env PANEL_IP=144.31.1.170 bash
+```
+
 Что спросит установщик:
 
-1. `PANEL_IP` мастер-панели
+1. `PANEL_IP` мастер-панели, если он не передан в команде
 2. `Enable xHTTP? (y/n)`
 3. домен для `xHTTP`, если выбрано `y`
 4. `SECRET_KEY`
