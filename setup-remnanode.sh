@@ -13,7 +13,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.0.6"
+INSTALLER_VERSION="4.0.7"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -356,15 +356,16 @@ prepare_package_network() {
 open_prompt_input() {
   [[ -n "$PROMPT_FD" ]] && return 0
 
-  if [[ -t 0 ]]; then
-    PROMPT_FD=0
+  # Keep prompts and answers on one dedicated read/write descriptor. This is
+  # more reliable than mixing inherited stdin and stderr through
+  # `curl | sudo ... bash`, especially in mobile SSH clients.
+  if { exec {PROMPT_FD}<>/dev/tty; } 2>/dev/null; then
+    PROMPT_FD_OWNED=1
     return 0
   fi
 
-  # `curl ... | bash` consumes stdin with the bootstrap script. Use the
-  # controlling terminal for all subsequent answers instead of the pipe.
-  if { exec {PROMPT_FD}</dev/tty; } 2>/dev/null; then
-    PROMPT_FD_OWNED=1
+  if [[ -t 0 ]]; then
+    PROMPT_FD=0
     return 0
   fi
 
@@ -384,9 +385,11 @@ ask() {
   local value=""
 
   open_prompt_input || die "Интерактивный ввод недоступен. Запустите команду из обычного SSH-терминала либо передайте параметры через PANEL_IP/PANEL_IPS, XHTTP_DOMAIN и SECRET_FILE."
-  # Print explicitly to stderr. `read -p` can hide a prompt when the caller
-  # captures stdout, which makes a working installer look frozen.
-  printf '%s' "$prompt" >&2
+  if [[ "$PROMPT_FD_OWNED" == "1" ]]; then
+    printf '\n%s' "$prompt" >&"$PROMPT_FD"
+  else
+    printf '\n%s' "$prompt" >&2
+  fi
   if ! IFS= read -r -u "$PROMPT_FD" value; then
     die "Ввод прерван на запросе: $prompt"
   fi
@@ -1296,7 +1299,7 @@ collect_inputs() {
       ENABLE_XHTTP=0
     else
       ask 'Настроить xHTTP через Nginx/TLS? [y/N]: '
-      answer="$PROMPT_VALUE"
+      answer="$(trim "$PROMPT_VALUE")"
       bool_true "$answer" && ENABLE_XHTTP=1 || ENABLE_XHTTP=0
     fi
   fi
