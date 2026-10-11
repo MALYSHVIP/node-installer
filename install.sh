@@ -2,12 +2,12 @@
 set -Eeuo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
-BOOTSTRAP_VERSION="1.1.1"
+BOOTSTRAP_VERSION="1.1.3"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 export INSTALLER_REPO INSTALLER_REF
 INSTALLER_FILE="${INSTALLER_FILE:-setup-remnanode.sh}"
-MIN_MAIN_INSTALLER_VERSION="4.0.7"
+MIN_MAIN_INSTALLER_VERSION="4.0.10"
 DOWNLOAD_ATTEMPTS=3
 TMP_FILE=""
 LOCAL_INSTALLER_USED=0
@@ -35,20 +35,38 @@ cleanup() {
   fi
 }
 
+current_bash() {
+  local candidate="${BASH:-}"
+  if [[ -n "$candidate" && -x "$candidate" ]]; then
+    printf '%s' "$candidate"
+  else
+    printf '/bin/bash'
+  fi
+}
+
 run_installer_script() {
   local installer="$1"
-  local rc=0
+  local bash_bin=""
   shift
+  bash_bin="$(current_bash)"
 
-  # /dev/tty can exist yet be unopenable in cron, cloud-init or a detached
-  # shell. Probe the open itself and otherwise preserve inherited stdin.
-  if { exec 7</dev/tty; } 2>/dev/null; then
-    bash "$installer" "$@" <&7 7<&- || rc=$?
-    exec 7<&-
-  else
-    bash "$installer" "$@" || rc=$?
+  # Replace the bootstrap, do not spawn a grandchild of sudo. With sudo-rs
+  # use_pty and piped stdin, a grandchild reading /dev/tty can stop on SIGTTIN
+  # without sudo receiving its status. Only the directly monitored child can
+  # reliably trigger sudo's foreground handover and be resumed.
+  # The installer owns cleanup of this one bootstrap-created temporary file
+  # after exec. Local source files must never be marked for deletion.
+  unset NODE_INSTALLER_BOOTSTRAP_TMP_FILE
+  if [[ -n "$TMP_FILE" && "$installer" == "$TMP_FILE" ]]; then
+    export NODE_INSTALLER_BOOTSTRAP_TMP_FILE="$TMP_FILE"
   fi
-  return "$rc"
+
+  # /dev/tty may exist but be unopenable in a detached/non-interactive shell.
+  if { exec 7</dev/tty; } 2>/dev/null; then
+    exec "$bash_bin" "$installer" "$@" <&7 7<&-
+  else
+    exec "$bash_bin" "$installer" "$@"
+  fi
 }
 
 run_local_installer() {
@@ -165,6 +183,7 @@ download_installer() {
 
 main() {
   local local_rc=0
+  local bash_bin=""
   need_root
   trap cleanup EXIT
   log "bootstrap version=${BOOTSTRAP_VERSION}"
@@ -174,10 +193,11 @@ main() {
     exit "$local_rc"
   fi
 
-  TMP_FILE="$(mktemp /tmp/node-installer.XXXXXX.sh)"
+  TMP_FILE="$(mktemp /tmp/node-installer.sh.XXXXXX)"
   download_installer
   [[ -s "$TMP_FILE" ]] || die "downloaded installer is empty"
-  bash -n "$TMP_FILE" || die "downloaded installer has invalid shell syntax"
+  bash_bin="$(current_bash)"
+  "$bash_bin" -n "$TMP_FILE" || die "downloaded installer has invalid shell syntax"
   chmod 700 "$TMP_FILE"
   run_installer_script "$TMP_FILE" "$@"
 }
