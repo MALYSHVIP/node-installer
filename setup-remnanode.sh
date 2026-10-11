@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# RemnaNode installer for the Remnawave 3.x generation (Node 3.4.1).
-# Reference: https://github.com/remnawave/node/releases/tag/3.4.1
+# RemnaNode installer for the Remnawave 3.x generation (Node 3.4.2).
+# Reference: https://github.com/remnawave/node/releases/tag/3.4.2
 # Reference: https://docs.rw/install/remnawave-node/
 # Supported hosts: Ubuntu/Debian, systemd, linux/amd64 or linux/arm64.
 # The installer deliberately does not patch files inside the RemnaNode image.
@@ -13,11 +13,11 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.0.7"
+INSTALLER_VERSION="4.0.9"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
-DEFAULT_NODE_VERSION="3.4.1"
+DEFAULT_NODE_VERSION="3.4.2"
 PANEL_COMPAT_VERSION="3.4.x (panel must already be upgraded)"
 MIN_XRAY_VERSION="26.7.28"
 
@@ -86,6 +86,7 @@ NGINX_LOCK_FILE="/run/lock/remnanode-nginx.lock"
 MODE="install"
 YES="${YES:-0}"
 DRY_RUN="${DRY_RUN:-0}"
+PROMPT_TIMEOUT="${PROMPT_TIMEOUT:-900}"
 BACKUP_REQUEST="${BACKUP_REQUEST:-}"
 
 # Preserve the distinction between "unset" and an explicitly supplied default.
@@ -175,8 +176,6 @@ ROLLBACK_STAGE_DIR=""
 BACKUP_STAGE_DIR=""
 BACKUP_DIR=""
 PROMPT_VALUE=""
-PROMPT_FD=""
-PROMPT_FD_OWNED=0
 LOCK_ACQUIRED=0
 MUTATION_STARTED=0
 ROLLBACK_RUNNING=0
@@ -212,14 +211,14 @@ die() {
 
 bool_true() {
   case "$(printf '%s' "${1:-0}" | tr '[:upper:]' '[:lower:]')" in
-    1|true|yes|y|on) return 0 ;;
+    1|true|yes|y|on|д|да) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 bool_valid() {
   case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
-    1|true|yes|y|on|0|false|no|n|off) return 0 ;;
+    1|true|yes|y|on|д|да|0|false|no|n|off|н|нет) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -353,51 +352,61 @@ prepare_package_network() {
   return 1
 }
 
-open_prompt_input() {
-  [[ -n "$PROMPT_FD" ]] && return 0
-
-  # Keep prompts and answers on one dedicated read/write descriptor. This is
-  # more reliable than mixing inherited stdin and stderr through
-  # `curl | sudo ... bash`, especially in mobile SSH clients.
-  if { exec {PROMPT_FD}<>/dev/tty; } 2>/dev/null; then
-    PROMPT_FD_OWNED=1
-    return 0
-  fi
-
-  if [[ -t 0 ]]; then
-    PROMPT_FD=0
-    return 0
-  fi
-
-  return 1
-}
-
-close_prompt_input() {
-  if [[ "$PROMPT_FD_OWNED" == "1" && -n "$PROMPT_FD" ]]; then
-    exec {PROMPT_FD}<&-
-  fi
-  PROMPT_FD=""
-  PROMPT_FD_OWNED=0
-}
-
 ask() {
   local prompt="$1"
   local value=""
+  local rc=0
 
-  open_prompt_input || die "Интерактивный ввод недоступен. Запустите команду из обычного SSH-терминала либо передайте параметры через PANEL_IP/PANEL_IPS, XHTTP_DOMAIN и SECRET_FILE."
-  if [[ "$PROMPT_FD_OWNED" == "1" ]]; then
-    printf '\n%s' "$prompt" >&"$PROMPT_FD"
+  [[ "$PROMPT_TIMEOUT" =~ ^[0-9]+$ ]] && (( PROMPT_TIMEOUT >= 1 && PROMPT_TIMEOUT <= 3600 )) || \
+    die "PROMPT_TIMEOUT должен быть целым числом от 1 до 3600 секунд."
+
+  # The bootstrap reconnects the child installer stdin to the SSH PTY.  Prefer
+  # that ordinary stdin path: it works consistently in OpenSSH and mobile SSH
+  # clients and avoids keeping a dynamic /dev/tty descriptor across prompts.
+  # Every prompt is a complete, newline-terminated stderr line so a client that
+  # buffers incomplete terminal lines cannot hide the next question.
+  if [[ -t 0 ]]; then
+    printf '\n[INPUT] %s\n' "$prompt" >&2
+    IFS= read -r -t "$PROMPT_TIMEOUT" value || rc=$?
+  elif { : </dev/tty; } 2>/dev/null; then
+    # Keep prompts on stderr even when the reply must be read from /dev/tty.
+    # SSH clients always display stderr; writing the question to /dev/tty
+    # itself is less portable and was the source of invisible questions.
+    printf '\n[INPUT] %s\n' "$prompt" >&2
+    IFS= read -r -t "$PROMPT_TIMEOUT" value </dev/tty || rc=$?
   else
-    printf '\n%s' "$prompt" >&2
+    die "Интерактивный ввод недоступен. Запустите команду из обычного SSH-терминала либо передайте параметры через PANEL_IP/PANEL_IPS, XHTTP_DOMAIN и SECRET_FILE."
   fi
-  if ! IFS= read -r -u "$PROMPT_FD" value; then
-    die "Ввод прерван на запросе: $prompt"
-  fi
+
+  (( rc == 0 )) || die "Ввод не получен или прерван на запросе: $prompt (таймаут ${PROMPT_TIMEOUT}s)."
   PROMPT_VALUE="$value"
 }
 
 ask_secret() {
   ask "SECRET_KEY из карточки ноды (ввод отображается): "
+}
+
+ask_bool() {
+  local prompt="$1"
+  local answer=""
+
+  while true; do
+    ask "$prompt"
+    answer="$(trim "$PROMPT_VALUE")"
+    if [[ -z "$answer" ]]; then
+      PROMPT_VALUE=0
+      return 0
+    fi
+    if bool_valid "$answer"; then
+      if bool_true "$answer"; then
+        PROMPT_VALUE=1
+      else
+        PROMPT_VALUE=0
+      fi
+      return 0
+    fi
+    warn "Непонятный ответ '$answer'. Введите y/д (да) или n/н (нет); Enter означает нет."
+  done
 }
 
 usage() {
@@ -410,7 +419,7 @@ Options:
   --panel-ip IP             IP/CIDR мастер-панели; можно повторять
   --panel-ips "LIST"        IPv4/IPv6/CIDR через запятую или пробел
   --node-port PORT          Control API port, default: 2222
-  --node-version VERSION    Pinned stable Node 3.x version, default: 3.4.1
+  --node-version VERSION    Pinned stable Node 3.x version, default: 3.4.2
   --image IMAGE             Official image override
   --xhttp-domain DOMAIN     Настроить Nginx/TLS для xHTTP
   --xhttp-path PATH         Default: /stable-in-443/
@@ -1275,8 +1284,6 @@ for key, name in files.items():
 }
 
 collect_inputs() {
-  local answer=""
-
   load_saved_state
   detect_legacy_xhttp
   validate_existing_compose_overrides
@@ -1298,9 +1305,8 @@ collect_inputs() {
     elif bool_true "$YES"; then
       ENABLE_XHTTP=0
     else
-      ask 'Настроить xHTTP через Nginx/TLS? [y/N]: '
-      answer="$(trim "$PROMPT_VALUE")"
-      bool_true "$answer" && ENABLE_XHTTP=1 || ENABLE_XHTTP=0
+      ask_bool 'Настроить xHTTP через Nginx/TLS? [y/д/N/н]'
+      ENABLE_XHTTP="$PROMPT_VALUE"
     fi
   fi
 
@@ -2365,7 +2371,6 @@ on_error() {
 
 cleanup_stage() {
   [[ "$BASHPID" == "$INSTALLER_MAIN_BASHPID" ]] || return 0
-  close_prompt_input
   release_installer_lock
   [[ -z "$STAGE_DIR" || ! -d "$STAGE_DIR" ]] || rm -rf "$STAGE_DIR"
   [[ -z "$SECRET_CHECK_DIR" || ! -d "$SECRET_CHECK_DIR" ]] || rm -rf "$SECRET_CHECK_DIR"
@@ -5323,7 +5328,7 @@ run_install() {
   fi
 
   if ! bool_true "$YES"; then
-    ask 'Применить этот план? Краткий перезапуск ноды прервёт подключения. [y/N]: '
+    ask_bool 'Применить этот план? Краткий перезапуск ноды прервёт подключения. [y/д/N/н]'
     bool_true "$PROMPT_VALUE" || {
       log "Отменено: изменений нет."
       return 0
