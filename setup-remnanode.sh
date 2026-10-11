@@ -13,10 +13,20 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.0.9"
+INSTALLER_VERSION="4.0.10"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
+BOOTSTRAP_TMP_FILE=""
+# The bootstrap execs this shell so sudo-rs directly monitors the process that
+# reads the terminal. Retain only its own validated temporary source path for
+# EXIT cleanup; never delete a local checkout or an arbitrary inherited path.
+if [[ "${NODE_INSTALLER_BOOTSTRAP_TMP_FILE:-}" == "${BASH_SOURCE[0]:-}" &&
+      "${BASH_SOURCE[0]:-}" == /tmp/node-installer.sh.* &&
+      -f "${BASH_SOURCE[0]}" && ! -L "${BASH_SOURCE[0]}" ]]; then
+  BOOTSTRAP_TMP_FILE="${BASH_SOURCE[0]}"
+fi
+unset NODE_INSTALLER_BOOTSTRAP_TMP_FILE
 DEFAULT_NODE_VERSION="3.4.2"
 PANEL_COMPAT_VERSION="3.4.x (panel must already be upgraded)"
 MIN_XRAY_VERSION="26.7.28"
@@ -767,7 +777,7 @@ is_installer_process() {
   [[ "$(stat -c %u "/proc/$pid" 2>/dev/null || printf 1)" == "0" ]] || return 1
   cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
   case "$cmdline" in
-    *setup-remnanode.sh*|*'/tmp/node-installer.'*.sh*) return 0 ;;
+    *setup-remnanode.sh*|*'/tmp/node-installer.'*.sh*|*'/tmp/node-installer.sh.'*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -2372,6 +2382,7 @@ on_error() {
 cleanup_stage() {
   [[ "$BASHPID" == "$INSTALLER_MAIN_BASHPID" ]] || return 0
   release_installer_lock
+  [[ -z "$BOOTSTRAP_TMP_FILE" ]] || rm -f -- "$BOOTSTRAP_TMP_FILE"
   [[ -z "$STAGE_DIR" || ! -d "$STAGE_DIR" ]] || rm -rf "$STAGE_DIR"
   [[ -z "$SECRET_CHECK_DIR" || ! -d "$SECRET_CHECK_DIR" ]] || rm -rf "$SECRET_CHECK_DIR"
   [[ -z "$ROLLBACK_STAGE_DIR" || ! -d "$ROLLBACK_STAGE_DIR" ]] || rm -rf "$ROLLBACK_STAGE_DIR"
@@ -4207,9 +4218,30 @@ ensure_certbot_renewal() {
   die "Certbot установлен без timer/cron для автоматического продления TLS."
 }
 
+nginx_https_listeners() {
+  local nginx_version="$1"
+  local enable_ipv6="${2:-0}"
+  local http2_suffix=" http2"
+  local modern_http2=0
+  # http2 on appeared in Nginx 1.25.1. Preserve the legacy listen option on
+  # older Debian/Ubuntu packages, but avoid its deprecation on new packages.
+  if [[ -n "$nginx_version" ]] && version_ge "$nginx_version" "1.25.1"; then
+    http2_suffix=""
+    modern_http2=1
+  fi
+  printf '    listen 443 ssl%s;\n' "$http2_suffix"
+  if bool_true "$enable_ipv6"; then
+    printf '    listen [::]:443 ssl%s;\n' "$http2_suffix"
+  fi
+  if (( modern_http2 == 1 )); then
+    printf '    http2 on;\n'
+  fi
+}
+
 write_nginx_xhttp_site() {
   local ipv6_http=""
-  local ipv6_https=""
+  local enable_ipv6=0
+  local https_listeners=""
   local grpc_socket_keepalive=""
   local nginx_version=""
   local tmp_site=""
@@ -4219,9 +4251,10 @@ write_nginx_xhttp_site() {
   local loaded_dump=""
   if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] && [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" == "0" ]]; then
     ipv6_http="    listen [::]:80;"
-    ipv6_https="    listen [::]:443 ssl http2;"
+    enable_ipv6=1
   fi
   nginx_version="$(nginx -v 2>&1 | sed -n 's#^nginx version: nginx/##p' | awk '{print $1}')"
+  https_listeners="$(nginx_https_listeners "$nginx_version" "$enable_ipv6")"
   if [[ -n "$nginx_version" ]] && version_ge "$nginx_version" "1.15.6"; then
     grpc_socket_keepalive="        grpc_socket_keepalive on;"
   else
@@ -4247,8 +4280,7 @@ $ipv6_http
 }
 
 server {
-    listen 443 ssl http2;
-$ipv6_https
+$https_listeners
     server_name $XHTTP_DOMAIN;
     server_tokens off;
     access_log off;
@@ -4949,11 +4981,20 @@ verify_local_xhttp_h2_edge() {
   return 1
 }
 
+verify_local_tls_h2_alpn() {
+  # s_client can also print binary HTTP/2 SETTINGS received after the TLS
+  # handshake. Inspect the stream directly instead of putting NUL bytes into
+  # a Bash variable. A closed stdin may make s_client exit nonzero after a
+  # valid handshake; the ALPN result, not that exit code, is the assertion.
+  { timeout 8 openssl s_client -connect 127.0.0.1:443 \
+      -servername "$XHTTP_DOMAIN" -alpn h2 </dev/null 2>&1 || true; } | \
+    LC_ALL=C grep -aFq 'ALPN protocol: h2'
+}
+
 verify_profile_transports() {
   local deadline=$((SECONDS + PROFILE_WAIT_SECONDS))
   local xhttp_ready=1
   local hysteria_ready=1
-  local alpn_output=""
   local listener_line=""
   local core_ready=0
 
@@ -4995,8 +5036,7 @@ verify_profile_transports() {
       verify_local_xhttp_h2_edge || \
         profile_not_ready "Локальный Nginx→xHTTP socket self-test не получил ожидаемый HTTP 400 на $XHTTP_PATH."
     fi
-    alpn_output="$(timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$XHTTP_DOMAIN" -alpn h2 </dev/null 2>&1 || true)"
-    grep -Fq 'ALPN protocol: h2' <<<"$alpn_output" || die "Локальная TLS-проверка xHTTP не согласовала HTTP/2 ALPN."
+    verify_local_tls_h2_alpn || die "Локальная TLS-проверка xHTTP не согласовала HTTP/2 ALPN."
   fi
 
   if bool_true "$EXPECT_HYSTERIA"; then
