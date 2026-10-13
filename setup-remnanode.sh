@@ -5,7 +5,8 @@ set -Eeuo pipefail
 # Reference: https://github.com/remnawave/node/releases/tag/3.4.2
 # Reference: https://docs.rw/install/remnawave-node/
 # Supported hosts: Ubuntu/Debian, systemd, linux/amd64 or linux/arm64.
-# The installer deliberately does not patch files inside the RemnaNode image.
+# Hysteria revocation is verified in an isolated container; a tested derived
+# image is built when required. Running container files are never patched.
 
 umask 027
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -13,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.0.10"
+INSTALLER_VERSION="4.0.11"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -1504,6 +1505,7 @@ print_plan() {
   printf '  mode:             %s\n' "$MODE"
   printf '  panel compatible: %s\n' "$PANEL_COMPAT_VERSION"
   printf '  node version:     %s\n' "$NODE_VERSION"
+  printf '  Hysteria revoke:  isolated TCP/UDP/VLESS self-test; automatic verified patch if needed\n'
   printf '  node port:        %s/tcp\n' "$NODE_PORT"
   printf '  panel sources:    %s\n' "$PANEL_IPS"
   printf '  firewall:         %s\n' "$MANAGE_FIREWALL"
@@ -2381,6 +2383,7 @@ on_error() {
 
 cleanup_stage() {
   [[ "$BASHPID" == "$INSTALLER_MAIN_BASHPID" ]] || return 0
+  cleanup_core_fix_build
   release_installer_lock
   [[ -z "$BOOTSTRAP_TMP_FILE" ]] || rm -f -- "$BOOTSTRAP_TMP_FILE"
   [[ -z "$STAGE_DIR" || ! -d "$STAGE_DIR" ]] || rm -rf "$STAGE_DIR"
@@ -4791,6 +4794,203 @@ select_and_pull_image() {
   die "Не удалось получить официальный RemnaNode $NODE_VERSION из GHCR или Docker Hub."
 }
 
+# Embedded Hysteria revocation guard. Never touches a running container's files.
+CORE_FIX_RELEASE="hy-revoke-v1"
+CORE_FIX_COMMIT="5ca6f4b7d4dc20a881d4330e498892697627ec0c"
+CORE_FIX_SOURCE_SHA256="45de3ead5186fea442b04c662c554a1ffd1d7bd9093a83410f2edabe74fb766e"
+CORE_FIX_BUILDER="golang@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd"
+CORE_FIX_OVERLAY_SHA256="8919161266736b7cf0a326372298a9018cdf8cab75133ce27ee171baf34cbe4c"
+CORE_FIX_OVERLAY_B64="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"
+CORE_FIX_PROBE_B64="Ly8gRGlzcG9zYWJsZSBjb250YWluZXIsIGxvb3BiYWNrIG9ubHksIHN5bnRoZXRpYyBjcmVkZW50aWFscywgbm8gTm9kZS9wYW5lbCBzdGF0ZS4KY29uc3QgYXNzZXJ0PXJlcXVpcmUoJ25vZGU6YXNzZXJ0L3N0cmljdCcpLGZzPXJlcXVpcmUoJ25vZGU6ZnMnKSxuZXQ9cmVxdWlyZSgnbm9kZTpuZXQnKSxkZ3JhbT1yZXF1aXJlKCdub2RlOmRncmFtJyk7CmNvbnN0IHtzcGF3bixzcGF3blN5bmN9PXJlcXVpcmUoJ25vZGU6Y2hpbGRfcHJvY2VzcycpLHtyYW5kb21VVUlELFg1MDlDZXJ0aWZpY2F0ZSxjcmVhdGVIYXNofT1yZXF1aXJlKCdub2RlOmNyeXB0bycpOwpjb25zdCBjZXJ0PWZzLnJlYWRGaWxlU3luYygnL3Byb2JlL2Z1bGxjaGFpbi5wZW0nLCd1dGY4Jyksa2V5PWZzLnJlYWRGaWxlU3luYygnL3Byb2JlL3ByaXZrZXkucGVtJywndXRmOCcpOwpjb25zdCBmaW5nZXJwcmludD1jcmVhdGVIYXNoKCdzaGEyNTYnKS51cGRhdGUobmV3IFg1MDlDZXJ0aWZpY2F0ZShjZXJ0KS5yYXcpLmRpZ2VzdCgnaGV4Jyk7CmNvbnN0IHByb2Nlc3Nlcz1bXSxzb2NrZXRzPW5ldyBTZXQoKTtjb25zdCBkZWxheT1tcz0+bmV3IFByb21pc2Uocj0+c2V0VGltZW91dChyLG1zKSk7CmZ1bmN0aW9uIHhyYXkoY29uZmlnKXsKIGNvbnN0IHA9c3Bhd24oJy91c3IvbG9jYWwvYmluL3hyYXknLFsncnVuJywnLWNvbmZpZycsJ3N0ZGluOiddLHtzdGRpbzpbJ3BpcGUnLCdwaXBlJywncGlwZSddfSk7cC5sb2dzPScnOwogcC5zdGRvdXQub24oJ2RhdGEnLGI9PntwLmxvZ3M9KHAubG9ncytiKS5zbGljZSgtNDAwMCl9KTtwLnN0ZGVyci5vbignZGF0YScsYj0+e3AubG9ncz0ocC5sb2dzK2IpLnNsaWNlKC00MDAwKX0pOwogcC5zdGRpbi5lbmQoSlNPTi5zdHJpbmdpZnkoY29uZmlnKSk7cHJvY2Vzc2VzLnB1c2gocCk7cmV0dXJuIHA7Cn0KYXN5bmMgZnVuY3Rpb24gc3RvcChwKXtpZihwLmV4aXRDb2RlPT09bnVsbCl7cC5raWxsKCdTSUdURVJNJyk7YXdhaXQgUHJvbWlzZS5yYWNlKFtuZXcgUHJvbWlzZShyPT5wLm9uY2UoJ2Nsb3NlJyxyKSksZGVsYXkoMTUwMCldKTtpZihwLmV4aXRDb2RlPT09bnVsbClwLmtpbGwoJ1NJR0tJTEwnKTt9fQpmdW5jdGlvbiBjbGllbnQoYXV0aCxwb3J0KXtyZXR1cm4geHJheSh7bG9nOntsb2dsZXZlbDonZXJyb3InfSxpbmJvdW5kczpbCiB7bGlzdGVuOicxMjcuMC4wLjEnLHBvcnQscHJvdG9jb2w6J2Rva29kZW1vLWRvb3InLHNldHRpbmdzOnthZGRyZXNzOicxMjcuMC4wLjEnLHBvcnQ6MTgwODAsbmV0d29yazondGNwJ319LAoge2xpc3RlbjonMTI3LjAuMC4xJyxwb3J0OnBvcnQrMTAscHJvdG9jb2w6J2Rva29kZW1vLWRvb3InLHNldHRpbmdzOnthZGRyZXNzOicxMjcuMC4wLjEnLHBvcnQ6MTgwODEsbmV0d29yazondWRwJ319CiBdLG91dGJvdW5kczpbe3Byb3RvY29sOidoeXN0ZXJpYScsc2V0dGluZ3M6e3ZlcnNpb246MixhZGRyZXNzOicxMjcuMC4wLjEnLHBvcnQ6MTg3NDN9LHN0cmVhbVNldHRpbmdzOntuZXR3b3JrOidoeXN0ZXJpYScsc2VjdXJpdHk6J3RscycsdGxzU2V0dGluZ3M6e3NlcnZlck5hbWU6J2xvY2FsaG9zdCcscGlubmVkUGVlckNlcnRTaGEyNTY6ZmluZ2VycHJpbnQsYWxwbjpbJ2gzJ119LGh5c3RlcmlhU2V0dGluZ3M6e3ZlcnNpb246MixhdXRofSxmaW5hbG1hc2s6e3F1aWNQYXJhbXM6e2Nvbmdlc3Rpb246J2Jicid9fX19XX0pO30KYXN5bmMgZnVuY3Rpb24gdGNwKHBvcnQsdXVpZCl7cmV0dXJuIG5ldyBQcm9taXNlKHJlc29sdmU9PnsKIGNvbnN0IHM9bmV0LmNvbm5lY3QocG9ydCwnMTI3LjAuMC4xJyk7c29ja2V0cy5hZGQocyk7Y29uc3QgbWFya2VyPSdwcm9iZS0nK3JhbmRvbVVVSUQoKTtsZXQgZG9uZT1mYWxzZSxkYXRhPUJ1ZmZlci5hbGxvYygwKTsKIGNvbnN0IHRpbWVyPXNldFRpbWVvdXQoKCk9PmZpbmlzaChmYWxzZSksMTgwMCk7CiBmdW5jdGlvbiBmaW5pc2gob2spe2lmKGRvbmUpcmV0dXJuO2RvbmU9dHJ1ZTtjbGVhclRpbWVvdXQodGltZXIpO3Mub2ZmKCdkYXRhJyxvbmRhdGEpO2lmKCFvaylzLmRlc3Ryb3koKTtyZXNvbHZlKHtvayxzfSk7fQogZnVuY3Rpb24gb25kYXRhKGIpe2RhdGE9QnVmZmVyLmNvbmNhdChbZGF0YSxiXSk7aWYoZGF0YS5pbmNsdWRlcyhCdWZmZXIuZnJvbShtYXJrZXIpKSlmaW5pc2godHJ1ZSk7fQogcy5vbignZGF0YScsb25kYXRhKTtzLm9uKCdlcnJvcicsKCk9PmZpbmlzaChmYWxzZSkpO3Mub24oJ2Nsb3NlJywoKT0+e3NvY2tldHMuZGVsZXRlKHMpO2ZpbmlzaChmYWxzZSl9KTsKIHMub24oJ2Nvbm5lY3QnLCgpPT57CiAgaWYodXVpZClzLndyaXRlKEJ1ZmZlci5jb25jYXQoW0J1ZmZlci5mcm9tKFswXSksQnVmZmVyLmZyb20odXVpZC5yZXBsYWNlQWxsKCctJywnJyksJ2hleCcpLEJ1ZmZlci5mcm9tKFswLDEsNzAsMTYwLDEsMTI3LDAsMCwxXSksQnVmZmVyLmZyb20obWFya2VyKV0pKTsKICBlbHNlIHMud3JpdGUobWFya2VyKTsKIH0pOwp9KTt9CmFzeW5jIGZ1bmN0aW9uIHBpbmcocyl7cmV0dXJuIG5ldyBQcm9taXNlKHJlc29sdmU9PnsKIGlmKHMuZGVzdHJveWVkKXJldHVybiByZXNvbHZlKGZhbHNlKTtjb25zdCBtYXJrZXI9cmFuZG9tVVVJRCgpO2xldCBkb25lPWZhbHNlLGRhdGE9QnVmZmVyLmFsbG9jKDApO2NvbnN0IHRpbWVyPXNldFRpbWVvdXQoKCk9PmZpbmlzaChmYWxzZSksMTIwMCk7CiBmdW5jdGlvbiBmaW5pc2gob2spe2lmKGRvbmUpcmV0dXJuO2RvbmU9dHJ1ZTtjbGVhclRpbWVvdXQodGltZXIpO3Mub2ZmKCdkYXRhJyxvbmRhdGEpO3Jlc29sdmUob2spO30KIGZ1bmN0aW9uIG9uZGF0YShiKXtkYXRhPUJ1ZmZlci5jb25jYXQoW2RhdGEsYl0pO2lmKGRhdGEuaW5jbHVkZXMoQnVmZmVyLmZyb20obWFya2VyKSkpZmluaXNoKHRydWUpO30KIHMub24oJ2RhdGEnLG9uZGF0YSk7cy53cml0ZShtYXJrZXIsZXJyPT57aWYoZXJyKWZpbmlzaChmYWxzZSl9KTsKfSk7fQphc3luYyBmdW5jdGlvbiB1ZHAocG9ydCl7cmV0dXJuIG5ldyBQcm9taXNlKHJlc29sdmU9PnsKIGNvbnN0IHM9ZGdyYW0uY3JlYXRlU29ja2V0KCd1ZHA0JyksbWFya2VyPUJ1ZmZlci5mcm9tKHJhbmRvbVVVSUQoKSk7bGV0IGRvbmU9ZmFsc2U7Y29uc3QgdGltZXI9c2V0VGltZW91dCgoKT0+ZmluaXNoKGZhbHNlKSwxMjAwKTsKIGZ1bmN0aW9uIGZpbmlzaChvayl7aWYoZG9uZSlyZXR1cm47ZG9uZT10cnVlO2NsZWFyVGltZW91dCh0aW1lcik7cy5jbG9zZSgpO3Jlc29sdmUob2spO30KIHMub24oJ2Vycm9yJywoKT0+ZmluaXNoKGZhbHNlKSk7cy5vbignbWVzc2FnZScsYj0+e2lmKGIuZXF1YWxzKG1hcmtlcikpZmluaXNoKHRydWUpfSk7cy5zZW5kKG1hcmtlcixwb3J0LCcxMjcuMC4wLjEnLGVycj0+e2lmKGVycilmaW5pc2goZmFsc2UpfSk7Cn0pO30KZnVuY3Rpb24gcmVtb3ZlKHRhZyxlbWFpbCl7CiBjb25zdCByPXNwYXduU3luYygnL3Vzci9sb2NhbC9iaW4veHJheScsWydhcGknLCdybXUnLCctLXNlcnZlcj0xMjcuMC4wLjE6MTg3NDAnLCctdGFnPScrdGFnLGVtYWlsXSx7ZW5jb2Rpbmc6J3V0ZjgnLHRpbWVvdXQ6ODAwMH0pOwogYXNzZXJ0KHIuc3RhdHVzPT09MCYmL1JlbW92ZWQgMSB1c2VyLy50ZXN0KHIuc3Rkb3V0KSwnUmVtb3ZhbCBBUEkgZGlkIG5vdCBjb25maXJtIG9uZSB1c2VyJyk7Cn0KKGFzeW5jKCk9PnsKIGNvbnN0IGVjaG89bmV0LmNyZWF0ZVNlcnZlcihzPT57c29ja2V0cy5hZGQocyk7cy5vbignZGF0YScsYj0+cy53cml0ZShiKSk7cy5vbignZXJyb3InLCgpPT57fSk7cy5vbignY2xvc2UnLCgpPT5zb2NrZXRzLmRlbGV0ZShzKSk7fSk7CiBjb25zdCB1ZHBlY2hvPWRncmFtLmNyZWF0ZVNvY2tldCgndWRwNCcpO3VkcGVjaG8ub24oJ21lc3NhZ2UnLChiLHIpPT51ZHBlY2hvLnNlbmQoYixyLnBvcnQsci5hZGRyZXNzKSk7CiBhd2FpdCBuZXcgUHJvbWlzZShyPT5lY2hvLmxpc3RlbigxODA4MCwnMTI3LjAuMC4xJyxyKSk7YXdhaXQgbmV3IFByb21pc2Uocj0+dWRwZWNoby5iaW5kKDE4MDgxLCcxMjcuMC4wLjEnLHIpKTsKIGNvbnN0IHJlcG9ydHM9W107bGV0IHJlc3VsdD0wOwogdHJ5e2ZvcihsZXQgcm91bmQ9MTtyb3VuZDw9Mztyb3VuZCsrKXsKICBjb25zdCBvbGQ9cmFuZG9tVVVJRCgpLGZyZXNoPXJhbmRvbVVVSUQoKTsKICBjb25zdCBzZXJ2ZXI9eHJheSh7bG9nOntsb2dsZXZlbDonZXJyb3InfSxhcGk6e3RhZzonYXBpJyxzZXJ2aWNlczpbJ0hhbmRsZXJTZXJ2aWNlJ119LGluYm91bmRzOlsKICAge3RhZzonYXBpLWluJyxsaXN0ZW46JzEyNy4wLjAuMScscG9ydDoxODc0MCxwcm90b2NvbDonZG9rb2RlbW8tZG9vcicsc2V0dGluZ3M6e2FkZHJlc3M6JzEyNy4wLjAuMSd9fSwKICAge3RhZzoncHJvYmUtaHknLGxpc3RlbjonMTI3LjAuMC4xJyxwb3J0OjE4NzQzLHByb3RvY29sOidoeXN0ZXJpYScsc2V0dGluZ3M6e3ZlcnNpb246MixjbGllbnRzOlt7YXV0aDpvbGQsZW1haWw6J3Byb2JlLW9sZCd9LHthdXRoOmZyZXNoLGVtYWlsOidwcm9iZS1uZXcnfV19LHN0cmVhbVNldHRpbmdzOntuZXR3b3JrOidoeXN0ZXJpYScsc2VjdXJpdHk6J3RscycsdGxzU2V0dGluZ3M6e2FscG46WydoMyddLGNlcnRpZmljYXRlczpbe2NlcnRpZmljYXRlOmNlcnQudHJpbSgpLnNwbGl0KCdcbicpLGtleTprZXkudHJpbSgpLnNwbGl0KCdcbicpfV19LGh5c3RlcmlhU2V0dGluZ3M6e3ZlcnNpb246Mn0sZmluYWxtYXNrOntxdWljUGFyYW1zOntjb25nZXN0aW9uOidiYnInfX19fSwKICAge3RhZzoncHJvYmUtdmxlc3MnLGxpc3RlbjonMTI3LjAuMC4xJyxwb3J0OjE4NzQxLHByb3RvY29sOid2bGVzcycsc2V0dGluZ3M6e2RlY3J5cHRpb246J25vbmUnLGNsaWVudHM6W3tpZDpvbGQsZW1haWw6J3ZsZXNzLW9sZCd9LHtpZDpmcmVzaCxlbWFpbDondmxlc3MtbmV3J31dfSxzdHJlYW1TZXR0aW5nczp7bmV0d29yazondGNwJyxzZWN1cml0eTonbm9uZSd9fQogIF0sb3V0Ym91bmRzOlt7dGFnOidkaXJlY3QnLHByb3RvY29sOidmcmVlZG9tJyxzZXR0aW5nczp7ZmluYWxSdWxlczpbe2FjdGlvbjonYWxsb3cnLGlwOlsnMTI3LjAuMC4xLzMyJ10scG9ydDonMTgwODAsMTgwODEnfV19fV0scm91dGluZzp7cnVsZXM6W3t0eXBlOidmaWVsZCcsaW5ib3VuZFRhZzpbJ2FwaS1pbiddLG91dGJvdW5kVGFnOidhcGknfV19fSk7CiAgY29uc3QgYT1jbGllbnQob2xkLDE4ODAxKSxiPWNsaWVudChmcmVzaCwxODgwMik7YXdhaXQgZGVsYXkoODAwKTsKICBjb25zdCBvbGRDb25uPWF3YWl0IHRjcCgxODgwMSksbmV3Q29ubj1hd2FpdCB0Y3AoMTg4MDIpOwogIGFzc2VydChvbGRDb25uLm9rJiZuZXdDb25uLm9rLCdTeW50aGV0aWMgaW5pdGlhbCBUQ1AgZmFpbGVkOiAnK3NlcnZlci5sb2dzKycgJythLmxvZ3MrJyAnK2IubG9ncyk7CiAgYXNzZXJ0KGF3YWl0IHVkcCgxODgxMSksJ1N5bnRoZXRpYyBpbml0aWFsIFVEUCBmYWlsZWQnKTsKICBjb25zdCB2QmVmb3JlPWF3YWl0IHRjcCgxODc0MSxvbGQpO2Fzc2VydCh2QmVmb3JlLm9rLCdTeW50aGV0aWMgVkxFU1MgaW5pdGlhbCBmYWlsZWQnKTt2QmVmb3JlLnMuZGVzdHJveSgpOwogIHJlbW92ZSgncHJvYmUtaHknLCdwcm9iZS1vbGQnKTsKICBjb25zdCBoZWxkUGFzc2VzPWF3YWl0IHBpbmcob2xkQ29ubi5zKSxuZXdPbGRTdHJlYW09YXdhaXQgdGNwKDE4ODAxKTtuZXdPbGRTdHJlYW0ucy5kZXN0cm95KCk7CiAgY29uc3Qgb2xkVWRwUGFzc2VzPWF3YWl0IHVkcCgxODgxMSksb3RoZXJIZWxkV29ya3M9YXdhaXQgcGluZyhuZXdDb25uLnMpLG90aGVyTmV3PWF3YWl0IHRjcCgxODgwMik7b3RoZXJOZXcucy5kZXN0cm95KCk7CiAgYXNzZXJ0KG90aGVySGVsZFdvcmtzJiZvdGhlck5ldy5vaywnVW5yZXZva2VkIEh5c3RlcmlhIHVzZXIgYWZmZWN0ZWQnKTsKICBpZihoZWxkUGFzc2VzfHxuZXdPbGRTdHJlYW0ub2t8fG9sZFVkcFBhc3Nlcyl7cmVwb3J0cy5wdXNoKHtyb3VuZCxyZXZvY2F0aW9uUGFzczpmYWxzZSxoZWxkUGFzc2VzLG5ld09sZFN0cmVhbVBhc3NlczpuZXdPbGRTdHJlYW0ub2ssb2xkVWRwUGFzc2VzLG90aGVyS2V5V29ya3M6dHJ1ZX0pO3Jlc3VsdD00MjticmVhazt9CiAgYXdhaXQgc3RvcChhKTtjb25zdCBmcmVzaE9sZENsaWVudD1jbGllbnQob2xkLDE4ODAxKTthd2FpdCBkZWxheSg1MDApO2NvbnN0IGZyZXNoT2xkPWF3YWl0IHRjcCgxODgwMSk7ZnJlc2hPbGQucy5kZXN0cm95KCk7YXNzZXJ0KCFmcmVzaE9sZC5vaywnUmV2b2tlZCBjcmVkZW50aWFsIGF1dGhlbnRpY2F0ZWQgYWdhaW4nKTsKICByZW1vdmUoJ3Byb2JlLXZsZXNzJywndmxlc3Mtb2xkJyk7Y29uc3Qgdk9sZD1hd2FpdCB0Y3AoMTg3NDEsb2xkKSx2TmV3PWF3YWl0IHRjcCgxODc0MSxmcmVzaCk7dk9sZC5zLmRlc3Ryb3koKTt2TmV3LnMuZGVzdHJveSgpOwogIGFzc2VydCghdk9sZC5vayYmdk5ldy5vaywnVkxFU1MgYXV0aGVudGljYXRpb24gcmVncmVzc2lvbicpOwogIHJlcG9ydHMucHVzaCh7cm91bmQscmV2b2NhdGlvblBhc3M6dHJ1ZSxoZWxkU3RyZWFtQ2xvc2VkOnRydWUsb2xkTmV3U3RyZWFtUmVqZWN0ZWQ6dHJ1ZSxvbGRVZHBSZWplY3RlZDp0cnVlLGZyZXNoT2xkUmVqZWN0ZWQ6dHJ1ZSxvdGhlcktleVdvcmtzOnRydWUsdmxlc3NSZWdyZXNzaW9uUGFzczp0cnVlfSk7CiAgb2xkQ29ubi5zLmRlc3Ryb3koKTtuZXdDb25uLnMuZGVzdHJveSgpO2Zvcihjb25zdCBwIG9mIFtzZXJ2ZXIsZnJlc2hPbGRDbGllbnQsYl0pYXdhaXQgc3RvcChwKTsKIH19ZmluYWxseXtmb3IoY29uc3QgcCBvZiBwcm9jZXNzZXMpYXdhaXQgc3RvcChwKTtmb3IoY29uc3QgcyBvZiBzb2NrZXRzKXMuZGVzdHJveSgpO2VjaG8uY2xvc2UoKTt1ZHBlY2hvLmNsb3NlKCk7fQogY29uc29sZS5sb2coSlNPTi5zdHJpbmdpZnkoe3Jldm9jYXRpb25QYXNzOnJlc3VsdD09PTAscmVwb3J0c30pKTtwcm9jZXNzLmV4aXRDb2RlPXJlc3VsdDsKfSkoKS5jYXRjaChlPT57Zm9yKGNvbnN0IHAgb2YgcHJvY2Vzc2VzKWlmKHAuZXhpdENvZGU9PT1udWxsKXAua2lsbCgnU0lHS0lMTCcpO2NvbnNvbGUuZXJyb3IoSlNPTi5zdHJpbmdpZnkoe3Jldm9jYXRpb25QYXNzOmZhbHNlLGluZnJhc3RydWN0dXJlRXJyb3I6ZS5tZXNzYWdlfSkpO3Byb2Nlc3MuZXhpdCgyKTt9KTsK"
+CORE_FIX_BUILD_DIR=""
+CORE_REVOCATION_MODE=""
+CORE_REVOCATION_SHA256=""
+CORE_BASE_IMAGE=""
+CORE_BASE_IMAGE_ID=""
+
+core_fix_architecture() {
+  case "${1:-$(uname -m)}" in
+    x86_64|amd64) printf amd64 ;;
+    aarch64|arm64) printf arm64 ;;
+    *) die "Hysteria guard: поддерживаются только linux/amd64 и linux/arm64." ;;
+  esac
+}
+
+cleanup_core_fix_build() {
+  local cid_file="" cid="" scope=""
+  [[ -n "$CORE_FIX_BUILD_DIR" && "$CORE_FIX_BUILD_DIR" == /var/tmp/remnanode-hy-build.* && -d "$CORE_FIX_BUILD_DIR" ]] || return 0
+  for cid_file in "$CORE_FIX_BUILD_DIR/probe.cid" "$CORE_FIX_BUILD_DIR/build.cid"; do
+    [[ -r "$cid_file" ]] || continue
+    cid="$(tr -d '\r\n' <"$cid_file")"
+    [[ "$cid" =~ ^[a-f0-9]{64}$ ]] || continue
+    scope="$(docker inspect --format '{{index .Config.Labels "io.tokervpn.installer-scope"}}' "$cid" 2>/dev/null || true)"
+    [[ "$scope" != core-revocation-selftest && "$scope" != core-revocation-build ]] || \
+      docker rm -f "$cid" >/dev/null 2>&1 || true
+  done
+  rm -rf -- "$CORE_FIX_BUILD_DIR"
+  CORE_FIX_BUILD_DIR=""
+}
+
+write_core_revocation_probe() {
+  local probe_dir="$1"
+  install -d -m 0700 "$probe_dir"
+  python3 - "$probe_dir/selftest.cjs" "$CORE_FIX_PROBE_B64" <<'PY'
+import base64,pathlib,sys
+pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(sys.argv[2],validate=True))
+PY
+  openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost \
+    -keyout "$probe_dir/privkey.pem" -out "$probe_dir/fullchain.pem" >/dev/null 2>&1
+  chmod 0600 "$probe_dir/privkey.pem" "$probe_dir/fullchain.pem" "$probe_dir/selftest.cjs"
+}
+
+core_revocation_probe_image() {
+  local image="$1" output="$2"
+  rm -f -- "$CORE_FIX_BUILD_DIR/probe.cid"
+  timeout --kill-after=10s 120s docker run --rm \
+    --cidfile "$CORE_FIX_BUILD_DIR/probe.cid" \
+    --label io.tokervpn.installer-scope=core-revocation-selftest \
+    --network none --user 0:0 --read-only --cap-drop ALL --security-opt no-new-privileges \
+    --pids-limit 64 --cpus 1 --memory 256m \
+    --tmpfs /tmp:rw,nosuid,noexec,size=32m \
+    -v "$CORE_FIX_BUILD_DIR/probe:/probe:ro" \
+    --entrypoint node "$image" /probe/selftest.cjs >"$output" 2>&1
+}
+
+apply_core_revocation_overlay() {
+  local source_dir="$1"
+  python3 - "$source_dir" "$CORE_FIX_OVERLAY_SHA256" "$CORE_FIX_OVERLAY_B64" <<'PY'
+import base64,gzip,hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1]);encoded=base64.b64decode(sys.argv[3],validate=True)
+if hashlib.sha256(encoded).hexdigest()!=sys.argv[2]:raise SystemExit('Embedded core overlay checksum mismatch')
+files=json.loads(gzip.decompress(encoded))
+expected={'common/protocol/user.go','common/protocol/revocable_sessions.go','common/protocol/revocable_sessions_test.go','proxy/hysteria/account/config.go','proxy/hysteria/account/revocation_test.go','transport/internet/hysteria/hub.go'}
+if set(files)!=expected:raise SystemExit('Unexpected core overlay paths')
+for name,entry in files.items():
+ path=root/name
+ if entry['before'] is None:
+  if path.exists():raise SystemExit('Overlay new file already exists: '+name)
+ elif not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest()!=entry['before']:
+  raise SystemExit('Unsupported Xray source layout: '+name)
+ raw=base64.b64decode(entry['content'],validate=True)
+ if hashlib.sha256(raw).hexdigest()!=entry['after']:raise SystemExit('Overlay content mismatch: '+name)
+for name,entry in files.items():(root/name).write_bytes(base64.b64decode(entry['content'],validate=True))
+PY
+}
+
+prepare_hysteria_revocation_guard() {
+  local arch="" image_arch="" stock_version="" rc=0 cached="" key="" cache_label=""
+  local build_memory=0 build_cpu=1 available_mb=0 free_mb=0 binary_sha=""
+  local original_image="$SELECTED_IMAGE" original_id="$SELECTED_IMAGE_ID"
+  arch="$(core_fix_architecture)"
+  image_arch="$(docker image inspect --format '{{.Architecture}}' "$original_id")"
+  [[ "$image_arch" == "$arch" ]] || die "Архитектура image $image_arch не совпадает с нодой $arch."
+  CORE_BASE_IMAGE="$original_image"
+  CORE_BASE_IMAGE_ID="$original_id"
+  CORE_FIX_BUILD_DIR="$(mktemp -d /var/tmp/remnanode-hy-build.XXXXXX)"
+  chmod 0700 "$CORE_FIX_BUILD_DIR"
+  write_core_revocation_probe "$CORE_FIX_BUILD_DIR/probe"
+  log "Hysteria guard: проверяю отзыв TCP/UDP и повторное подключение на изолированном loopback."
+  if core_revocation_probe_image "$original_id" "$CORE_FIX_BUILD_DIR/upstream-probe.json"; then
+    CORE_REVOCATION_MODE=upstream-verified
+    CORE_REVOCATION_SHA256="$(docker run --rm --network none --cap-drop ALL --entrypoint sha256sum "$original_id" /usr/local/bin/xray | awk '{print $1}')"
+    [[ "$CORE_REVOCATION_SHA256" =~ ^[a-f0-9]{64}$ ]] || die "Не удалось проверить checksum официального ядра."
+    install -m 0600 "$CORE_FIX_BUILD_DIR/upstream-probe.json" "$BACKUP_DIR/core-revocation-selftest.json"
+    log "Официальное ядро уже корректно отзывает соединения: три прогона пройдены."
+    cleanup_core_fix_build
+    return 0
+  else
+    rc=$?
+  fi
+  if (( rc != 42 )); then
+    install -m 0600 "$CORE_FIX_BUILD_DIR/upstream-probe.json" "$BACKUP_DIR/core-revocation-error.log"
+    die "Не удалось достоверно проверить Hysteria (код $rc). Работающая нода не будет заменена непроверенным ядром."
+  fi
+  stock_version="$(docker run --rm --network none --entrypoint xray "$original_id" version | head -n1)"
+  [[ "$stock_version" == *"Xray 26.7.28 "* && "$stock_version" =~ [[:space:]]5ca6f4b[[:space:]] ]] || \
+    die "Обнаружена ошибка отзыва в неизвестном ядре: $stock_version. Автоматическое понижение версии запрещено; нужен патч для этой версии."
+  key="${NODE_VERSION}-${original_id#sha256:}-$arch-${CORE_FIX_OVERLAY_SHA256:0:12}"
+  cached="remnanode-hysteria-revoke:${key:0:120}"
+  if docker image inspect "$cached" >/dev/null 2>&1; then
+    cache_label="$(docker image inspect --format '{{index .Config.Labels "io.tokervpn.revocation.base"}}' "$cached")"
+    [[ "$cache_label" == "$original_id" ]] || die "Неверная provenance кешированного образа исправления."
+    [[ "$(docker image inspect --format '{{index .Config.Labels "io.tokervpn.revocation.overlay"}}' "$cached")" == "$CORE_FIX_OVERLAY_SHA256" ]] || die "Неверный patch ID кешированного образа."
+    binary_sha="$(docker image inspect --format '{{index .Config.Labels "io.tokervpn.revocation.sha256"}}' "$cached")"
+  else
+    available_mb="$(awk '/MemAvailable:/ {print int($2/1024)}' /proc/meminfo)"
+    [[ "$available_mb" =~ ^[0-9]+$ ]] || die "Не удалось определить доступную память для сборки."
+    (( available_mb >= 768 )) || die "Для первой сборки исправления нужны минимум 768 MiB свободной RAM; работающая нода сохранена."
+    build_memory=$((available_mb / 2));(( build_memory >= 512 )) || build_memory=512
+    (( build_memory <= 1536 )) || build_memory=1536
+    build_cpu="$(nproc)";(( build_cpu <= 2 )) || build_cpu=2
+    free_mb="$(df -Pm "$CORE_FIX_BUILD_DIR" | awk 'NR==2 {print $4}')"
+    [[ "$free_mb" =~ ^[0-9]+$ ]] && (( free_mb >= 3500 )) || die "Для первой сборки нужны 3.5 GiB свободного места."
+    log "Собираю исправленное ядро для $arch: до $build_cpu CPU, ${build_memory}MiB RAM."
+    curl --proto '=https' --tlsv1.2 -fL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 180 \
+      "https://codeload.github.com/XTLS/Xray-core/tar.gz/$CORE_FIX_COMMIT" -o "$CORE_FIX_BUILD_DIR/source.tgz"
+    printf '%s  %s\n' "$CORE_FIX_SOURCE_SHA256" "$CORE_FIX_BUILD_DIR/source.tgz" | sha256sum -c - >/dev/null
+    install -d -m 0700 "$CORE_FIX_BUILD_DIR/source" "$CORE_FIX_BUILD_DIR/image"
+    tar -xzf "$CORE_FIX_BUILD_DIR/source.tgz" --strip-components=1 -C "$CORE_FIX_BUILD_DIR/source"
+    apply_core_revocation_overlay "$CORE_FIX_BUILD_DIR/source"
+    docker pull "$CORE_FIX_BUILDER"
+    timeout --kill-after=20s 1800s docker run --rm \
+      --cidfile "$CORE_FIX_BUILD_DIR/build.cid" --label io.tokervpn.installer-scope=core-revocation-build \
+      --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 \
+      --cpus "$build_cpu" --memory "${build_memory}m" --memory-swap "${build_memory}m" \
+      -e CGO_ENABLED=0 -e GOTOOLCHAIN=local -e GOENV=off -e GOMAXPROCS="$build_cpu" \
+      -e GOMEMLIMIT="$((build_memory - 128))MiB" \
+      -e GOPROXY=https://proxy.golang.org,direct -e GOSUMDB=sum.golang.org \
+      -v "$CORE_FIX_BUILD_DIR/source:/src:rw" -v "$CORE_FIX_BUILD_DIR/image:/out:rw" -w /src \
+      "$CORE_FIX_BUILDER" sh -ec '
+        go test -p 1 -count=3 ./common/protocol ./proxy/hysteria/account
+        go build -p 1 -trimpath -buildvcs=false -ldflags "-s -w -X github.com/xtls/xray-core/core.build=tokervpn-hy-revoke-v1-5ca6f4b" -o /out/xray ./main
+      ' >"$CORE_FIX_BUILD_DIR/build.log" 2>&1 || {
+        install -m 0600 "$CORE_FIX_BUILD_DIR/build.log" "$BACKUP_DIR/core-revocation-build.log"
+        die "Сборка исправленного ядра не прошла. Подробности: $BACKUP_DIR/core-revocation-build.log"
+      }
+    binary_sha="$(sha256sum "$CORE_FIX_BUILD_DIR/image/xray" | awk '{print $1}')"
+    [[ "$binary_sha" =~ ^[a-f0-9]{64}$ ]] || die "Checksum нового ядра не определён."
+    chmod 0755 "$CORE_FIX_BUILD_DIR/image/xray"
+    [[ "$(docker image inspect --format '{{.Id}}' "$original_image")" == "$original_id" ]] || die "Официальный image tag изменился во время сборки."
+    printf 'FROM %s\nCOPY xray /usr/local/bin/xray\nLABEL io.tokervpn.revocation.base="%s" io.tokervpn.revocation.overlay="%s" io.tokervpn.revocation.sha256="%s"\n' \
+      "$original_image" "$original_id" "$CORE_FIX_OVERLAY_SHA256" "$binary_sha" >"$CORE_FIX_BUILD_DIR/image/Dockerfile"
+    docker build --network none --pull=false -t "$cached" "$CORE_FIX_BUILD_DIR/image" >"$CORE_FIX_BUILD_DIR/image-build.log" 2>&1 || {
+      install -m 0600 "$CORE_FIX_BUILD_DIR/image-build.log" "$BACKUP_DIR/core-revocation-image-build.log"
+      die "Не удалось собрать производный образ с исправленным ядром."
+    }
+    # Verify that the Node application itself and all its original layers remain intact.
+    docker image inspect "$original_id" "$cached" >"$CORE_FIX_BUILD_DIR/image-inspect.json"
+    python3 - "$CORE_FIX_BUILD_DIR/image-inspect.json" <<'PY'
+import json,sys
+base,fixed=json.load(open(sys.argv[1]))
+if fixed['RootFS']['Layers'][:-1]!=base['RootFS']['Layers']:raise SystemExit('Derived Node base layers changed')
+PY
+  fi
+  [[ "$binary_sha" =~ ^[a-f0-9]{64}$ ]] || die "Нет доказанного checksum исправленного ядра."
+  [[ "$(docker run --rm --network none --entrypoint sha256sum "$cached" /usr/local/bin/xray | awk '{print $1}')" == "$binary_sha" ]] || die "Checksum ядра образа не совпадает с метаданными."
+  log "Проверяю готовый образ: три прогона TCP, UDP, нового подключения и VLESS."
+  if ! core_revocation_probe_image "$cached" "$CORE_FIX_BUILD_DIR/fixed-probe.json"; then
+    install -m 0600 "$CORE_FIX_BUILD_DIR/fixed-probe.json" "$BACKUP_DIR/core-revocation-error.log"
+    die "Исправленный образ не прошёл сетевой self-test. Замена ноды отменена."
+  fi
+  install -m 0600 "$CORE_FIX_BUILD_DIR/fixed-probe.json" "$BACKUP_DIR/core-revocation-selftest.json"
+  SELECTED_IMAGE="$cached"
+  SELECTED_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$cached")"
+  CORE_REVOCATION_MODE=patched-verified
+  CORE_REVOCATION_SHA256="$binary_sha"
+  log "Hysteria guard готов: три сетевых прогона успешны; образ $SELECTED_IMAGE."
+  cleanup_core_fix_build
+}
+
+verify_core_revocation_guard_runtime() {
+  local runtime_sha=""
+  [[ "$CORE_REVOCATION_SHA256" =~ ^[a-f0-9]{64}$ ]] || die "Отзыв Hysteria не подтверждён подготовкой image."
+  runtime_sha="$(docker exec remnanode sha256sum /usr/local/bin/rw-core | awk '{print $1}')"
+  [[ "$runtime_sha" == "$CORE_REVOCATION_SHA256" ]] || \
+    die "Панель/конфигурация подменила проверенное ядро. Runtime checksum не совпадает; нужен отдельный совместимый патч."
+  log "Runtime Hysteria guard: $CORE_REVOCATION_MODE; checksum подтверждён."
+}
+
 render_node_files() {
   local shm_mount=""
   local setting="" value=""
@@ -5101,6 +5301,7 @@ PY
   xray_version="$(docker exec remnanode rw-core version 2>/dev/null | head -n1 || true)"
   [[ "$xray_version" =~ Xray[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+) ]] || die "Не удалось определить встроенный Xray."
   version_ge "${BASH_REMATCH[1]}" "$MIN_XRAY_VERSION" || die "Xray ${BASH_REMATCH[1]} старее $MIN_XRAY_VERSION."
+  verify_core_revocation_guard_runtime
 
   verify_native_plugins
 
@@ -5131,6 +5332,9 @@ write_state() {
   {
     printf 'SAVED_NODE_VERSION=%q\n' "$NODE_VERSION"
     printf 'SAVED_NODE_IMAGE=%q\n' "$SELECTED_IMAGE"
+    printf 'SAVED_CORE_BASE_IMAGE=%q\n' "$CORE_BASE_IMAGE"
+    printf 'SAVED_CORE_REVOCATION_MODE=%q\n' "$CORE_REVOCATION_MODE"
+    printf 'SAVED_CORE_REVOCATION_SHA256=%q\n' "$CORE_REVOCATION_SHA256"
     printf 'SAVED_NODE_PORT=%q\n' "$NODE_PORT"
     printf 'SAVED_PANEL_IPS=%q\n' "$PANEL_IPS"
     printf 'SAVED_ENABLE_XHTTP=%q\n' "$ENABLE_XHTTP"
@@ -5381,6 +5585,7 @@ run_install() {
   validate_panel_ips_strict
   validate_secret_payload
   select_and_pull_image
+  prepare_hysteria_revocation_guard
   render_node_files
   stop_legacy_units
   prepare_directories
