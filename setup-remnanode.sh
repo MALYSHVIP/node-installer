@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.0.11"
+INSTALLER_VERSION="4.0.12"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -93,6 +93,9 @@ NGINX_ACME_ROOT="/var/www/remnanode-acme"
 CERT_DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/50-remnanode-tls"
 NGINX_CAPACITY_DROPIN="/etc/systemd/system/nginx.service.d/60-remnanode-capacity.conf"
 NGINX_LOCK_FILE="/run/lock/remnanode-nginx.lock"
+COVER_ROOT="/var/www/remnanode-cover"
+HYSTERIA_MASQUERADE_FILE="$STATE_DIR/hysteria-masquerade.json"
+HYSTERIA_COVER_STATUS="not-checked"
 
 MODE="install"
 YES="${YES:-0}"
@@ -478,6 +481,15 @@ Update/repair target the version built into this installer, not an old saved tag
 The installer does not upgrade the master panel, bots or third-party keys.
 Backups contain secrets: keep /var/backups/remnanode private (root only).
 Rollback restores managed configuration/image; it does not downgrade OS packages.
+
+Cover protection:
+  xHTTP/Nginx: public page + custom 404, HTTP 301, TLS 1.2/1.3 and HSTS.
+  UDP/443 stays with Hysteria; Nginx does not claim QUIC or advertise Alt-Svc.
+  Hysteria masquerade is controlled by the MASTER-PANEL profile, not .env.
+  A ready masquerade object is saved at:
+    /var/lib/remnanode-installer/hysteria-masquerade.json
+  This object is NOT a full profile. Preserve BBR, users, routes and bridges.
+  No protection can guarantee that a provider will not block an IP/protocol.
 EOF
 }
 
@@ -1715,6 +1727,7 @@ backup_system_paths() {
     "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" \
     "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" \
     "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" "$TLS_DIR" "$PANEL_IPS_FILE" \
+    "$COVER_ROOT/index.html" "$COVER_ROOT/404.html" "$HYSTERIA_MASQUERADE_FILE" \
     /etc/nginx/conf.d/00-remnanode-hash-tuning.conf \
     /etc/fstab /etc/nginx/nginx.conf /etc/ufw/user.rules /etc/ufw/user6.rules; do
     [[ -e "$path" || -L "$path" ]] || continue
@@ -1930,7 +1943,8 @@ remove_known_current_files_for_rollback() {
     "$SSH_PEERS_PUBLIC_KEY" "$SSH_PEERS_TOKEN" "$SSH_PEERS_NODE_IP" \
     "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" \
     "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" \
-    "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" /etc/nginx/conf.d/00-remnanode-hash-tuning.conf
+    "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" /etc/nginx/conf.d/00-remnanode-hash-tuning.conf \
+    "$COVER_ROOT/index.html" "$COVER_ROOT/404.html" "$HYSTERIA_MASQUERADE_FILE"
   while IFS= read -r path; do
     rm -f -- "$path"
   done < <(legacy_paths)
@@ -3058,11 +3072,11 @@ $ipv6_elements_line
     chain input {
         type filter hook input priority -5; policy accept;
         iifname "lo" tcp dport $NODE_PORT accept
-$public_tcp_rule
-$public_udp_rule
         ip saddr @panel_v4 tcp dport $NODE_PORT accept
         ip6 saddr @panel_v6 tcp dport $NODE_PORT accept
         tcp dport $NODE_PORT drop
+$public_tcp_rule
+$public_udp_rule
     }
 
     chain output {
@@ -4241,17 +4255,68 @@ nginx_https_listeners() {
   fi
 }
 
-write_nginx_xhttp_site() {
+write_cover_assets() {
+  # These are PUBLIC, self-contained pages; no accounts, remote assets or JS.
+  # Existing custom pages in this dedicated directory are preserved.
+  [[ ! -L "$COVER_ROOT" ]] || die "COVER_ROOT не должен быть symlink."
+  [[ ! -L "$HYSTERIA_MASQUERADE_FILE" ]] || die "Masquerade export не должен быть symlink."
+  install -d -m 0755 "$COVER_ROOT"
+  install -d -m 0700 "$STATE_DIR"
+  python3 - "$COVER_ROOT" "$HYSTERIA_MASQUERADE_FILE" <<'PY'
+import json, os, tempfile
+from pathlib import Path
+import sys
+root, export = Path(sys.argv[1]), Path(sys.argv[2])
+page = '''<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Заметки о простом</title><meta name="description" content="Короткие заметки о прогулках, книгах и спокойном ритме жизни.">
+<style>body{margin:0;background:#f4f1ea;color:#28332d;font:18px/1.7 Georgia,serif}main{max-width:780px;margin:auto;padding:70px 24px}header{border-bottom:1px solid #d5d7cd;padding-bottom:28px;margin-bottom:36px}small,footer{color:#657269;font:14px/1.6 sans-serif}h1{font-size:clamp(32px,7vw,54px);line-height:1.15;margin:14px 0}h2{font-size:24px}article{margin:32px 0;padding:24px;background:#fffdf8;border-radius:12px}a{color:#3e6551}footer{padding:24px 0;border-top:1px solid #d5d7cd}</style>
+</head><body><main><header><small>НЕБОЛЬШОЙ ЛИЧНЫЙ ЖУРНАЛ</small><h1>Заметки о простом</h1><p>Иногда достаточно остановиться и заметить то, что обычно остаётся между делами.</p><nav><a href="#walk">Прогулки</a> · <a href="#books">Книги</a> · <a href="#home">Дом</a></nav></header>
+<article id="walk"><h2>Дорога без спешки</h2><p>Привычная улица становится другой, когда идёшь чуть медленнее. Можно рассмотреть окна старых домов, услышать птиц и найти удобную скамейку под деревом.</p></article>
+<article id="books"><h2>Несколько страниц вечером</h2><p>Не обязательно заканчивать книгу за неделю. Иногда одна мысль заслуживает больше времени, чем целая глава. Закладка помогает вернуться к разговору завтра.</p></article>
+<article id="home"><h2>Место для паузы</h2><p>Чашка чая, открытое окно и чистый стол — простые вещи, которые помогают переключиться после насыщенного дня. Здесь собираются именно такие небольшие наблюдения.</p></article>
+<footer>Заметки о простом · Личный журнал</footer></main></body></html>
+'''
+missing = '''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Страница не найдена</title><style>body{max-width:680px;margin:12vh auto;padding:24px;background:#f4f1ea;color:#28332d;font:20px/1.6 Georgia,serif}a{color:#3e6551}</style><h1>Страница не найдена</h1><p>Возможно, адрес изменился. Вернитесь к последним заметкам.</p><a href="/">На главную</a></html>'''
+def atomic(path, content, mode):
+    if path.is_symlink():
+        raise SystemExit('Refusing symlink: ' + str(path))
+    fd, name = tempfile.mkstemp(prefix='.cover-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(content)
+            f.flush()
+            os.fchmod(f.fileno(), mode)
+            os.fsync(f.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+for name, content in [('index.html', page), ('404.html', missing)]:
+    path = root / name
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise SystemExit('Refusing non-regular cover file: ' + str(path))
+    if not path.exists():
+        atomic(path, content, 0o644)
+    elif path.stat().st_size == 0 or path.stat().st_size > 262144:
+        raise SystemExit('Existing public cover page must be nonempty and <= 256 KiB: ' + str(path))
+# This object belongs ONLY in streamSettings.hysteriaSettings.masquerade.
+# It is not an entire panel profile. Never overwrite the running core config.
+masquerade = {'type': 'string', 'statusCode': 200,
+    'content': (root / 'index.html').read_text(encoding='utf-8'),
+    'headers': {'Content-Type': 'text/html; charset=utf-8',
+                'Strict-Transport-Security': 'max-age=604800',
+                'X-Content-Type-Options': 'nosniff'}}
+atomic(export, json.dumps(masquerade, ensure_ascii=False, indent=2) + '\n', 0o600)
+PY
+}
+
+render_nginx_xhttp_site() {
   local ipv6_http=""
   local enable_ipv6=0
   local https_listeners=""
   local grpc_socket_keepalive=""
   local nginx_version=""
-  local tmp_site=""
-  local changed=0
-  local had_bootstrap=0
-  local edge_status=""
-  local loaded_dump=""
   if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] && [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" == "0" ]]; then
     ipv6_http="    listen [::]:80;"
     enable_ipv6=1
@@ -4264,13 +4329,13 @@ write_nginx_xhttp_site() {
     warn "Nginx ${nginx_version:-unknown} не поддерживает grpc_socket_keepalive; xHTTP останется совместимым без этой необязательной директивы."
   fi
 
-  tmp_site="$(mktemp)"
-  cat >"$tmp_site" <<EOF
+  cat <<EOF
 # remnanode-installer-managed-xhttp
 server {
     listen 80;
 $ipv6_http
     server_name $XHTTP_DOMAIN;
+    server_tokens off;
 
     location ^~ /.well-known/acme-challenge/ {
         root $NGINX_ACME_ROOT;
@@ -4278,7 +4343,7 @@ $ipv6_http
     }
 
     location / {
-        return 301 https://\$host\$request_uri;
+        return 301 https://$XHTTP_DOMAIN\$request_uri;
     }
 }
 
@@ -4287,6 +4352,8 @@ $https_listeners
     server_name $XHTTP_DOMAIN;
     server_tokens off;
     access_log off;
+    add_header Strict-Transport-Security "max-age=604800" always;
+    add_header X-Content-Type-Options nosniff always;
 
     ssl_certificate $TLS_DIR/fullchain.pem;
     ssl_certificate_key $TLS_DIR/privkey.pem;
@@ -4299,9 +4366,14 @@ $https_listeners
     keepalive_requests 1000;
     reset_timedout_connection on;
 
-    location = / {
-        return 204;
-    }
+    root $COVER_ROOT;
+    index index.html;
+    charset utf-8;
+    autoindex off;
+    disable_symlinks on;
+    error_page 404 /404.html;
+
+    location = /404.html { internal; }
 
     location ^~ $XHTTP_PATH {
         client_max_body_size 0;
@@ -4317,10 +4389,53 @@ $grpc_socket_keepalive
     }
 
     location / {
-        return 404;
+        try_files \$uri \$uri/ =404;
     }
 }
 EOF
+}
+
+verify_local_cover() {
+  local check_dir="" cycle="" version="" status=""
+  check_dir="$(mktemp -d /tmp/remnanode-cover-check.XXXXXX)"
+  for cycle in 1 2 3; do
+    for version in 1.2 1.3; do
+      status="$(curl -sS --http1.1 --noproxy '*' --cacert "$TLS_DIR/fullchain.pem" \
+        --tlsv"$version" --tls-max "$version" --connect-timeout 3 --max-time 8 \
+        --resolve "$XHTTP_DOMAIN:443:127.0.0.1" -D "$check_dir/headers" \
+        -o "$check_dir/body" -w '%{http_code}' "https://$XHTTP_DOMAIN/" 2>/dev/null || true)"
+      if [[ "$status" != 200 ]] || ! cmp -s "$check_dir/body" "$COVER_ROOT/index.html" || \
+         ! grep -Eiq '^Strict-Transport-Security:[[:space:]]*max-age=604800' "$check_dir/headers"; then
+        rm -rf -- "$check_dir"
+        die "Прикрытие: TLS $version / HTTP 200 / HSTS / содержимое не подтверждены (проверка $cycle)."
+      fi
+    done
+    status="$(curl -sS --noproxy '*' --connect-timeout 3 --max-time 8 \
+      --resolve "$XHTTP_DOMAIN:80:127.0.0.1" -D "$check_dir/headers" \
+      -o /dev/null -w '%{http_code}' "http://$XHTTP_DOMAIN/" 2>/dev/null || true)"
+    if [[ "$status" != 301 ]] || ! tr -d '\r' <"$check_dir/headers" | \
+       grep -Fixq "Location: https://$XHTTP_DOMAIN/"; then
+      rm -rf -- "$check_dir"
+      die "Прикрытие: HTTP/80 не перенаправляет на правильный HTTPS-домен."
+    fi
+    status="$(curl -sS --noproxy '*' --cacert "$TLS_DIR/fullchain.pem" --connect-timeout 3 --max-time 8 \
+      --resolve "$XHTTP_DOMAIN:443:127.0.0.1" -D "$check_dir/headers" -o "$check_dir/body" \
+      -w '%{http_code}' "https://$XHTTP_DOMAIN/remnanode-check-missing-$$-$cycle" 2>/dev/null || true)"
+    if [[ "$status" != 404 ]] || ! cmp -s "$check_dir/body" "$COVER_ROOT/404.html" || \
+       ! grep -Eiq '^Strict-Transport-Security:[[:space:]]*max-age=604800' "$check_dir/headers"; then
+      rm -rf -- "$check_dir"
+      die "Прикрытие: собственная страница 404 с HSTS не подтверждена."
+    fi
+  done
+  rm -rf -- "$check_dir"
+  log "Прикрытие HTTPS: три проверки HTTP 301, TLS 1.2/1.3, страницы и HSTS успешны."
+}
+
+write_nginx_xhttp_site() {
+  local tmp_site="" changed=0 had_bootstrap=0 loaded_dump=""
+  write_cover_assets
+  tmp_site="$(mktemp)"
+  render_nginx_xhttp_site >"$tmp_site"
   if [[ ! -r "$NGINX_SITE_AVAILABLE" ]] || ! cmp -s "$tmp_site" "$NGINX_SITE_AVAILABLE"; then
     install -m 0644 "$tmp_site" "$NGINX_SITE_AVAILABLE"
     changed=1
@@ -4349,10 +4464,7 @@ EOF
   elif (( changed == 1 || had_bootstrap == 1 || TLS_CHANGED == 1 )); then
     systemctl reload nginx
   fi
-  edge_status="$(curl -ksS --http1.1 --noproxy '*' --connect-timeout 3 --max-time 8 \
-    --resolve "$XHTTP_DOMAIN:443:127.0.0.1" -o /dev/null -w '%{http_code}' \
-    "https://$XHTTP_DOMAIN/" 2>/dev/null || true)"
-  [[ "$edge_status" == "204" ]] || die "Локальный TLS/SNI probe не попал в managed xHTTP vhost (HTTP ${edge_status:-none})."
+  verify_local_cover
   (( changed == 0 )) || log "xHTTP Nginx site обновлён."
 }
 
@@ -5170,7 +5282,7 @@ verify_local_xhttp_h2_edge() {
   local attempt=0
   local headers=""
   for attempt in 1 2 3 4 5; do
-    headers="$(curl -ksS --http2 --noproxy '*' --connect-timeout 3 --max-time 8 \
+    headers="$(curl -sS --http2 --noproxy '*' --cacert "$TLS_DIR/fullchain.pem" --connect-timeout 3 --max-time 8 \
       --resolve "$XHTTP_DOMAIN:443:127.0.0.1" -o /dev/null -D - \
       "https://$XHTTP_DOMAIN$XHTTP_PATH" 2>/dev/null || true)"
     if grep -qE '^HTTP/2 400([[:space:]]|$)' <<<"$headers"; then
@@ -5251,6 +5363,91 @@ verify_profile_transports() {
   fi
 }
 
+read_live_profile_for_cover_check() {
+  # Private in-memory pipe ONLY. Never save/print the raw profile or its users.
+  timeout 15 python3 - <<'PY'
+import http.client, json, socket, subprocess, sys
+from pathlib import Path
+try:
+    lines = subprocess.check_output(['docker', 'top', 'remnanode', '-eo', 'pid,comm'],
+        text=True, stderr=subprocess.DEVNULL, timeout=4).splitlines()[1:]
+    candidates = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 2 or not fields[0].isdigit() or fields[1] not in ('rw-core', 'xray'):
+            continue
+        args = Path('/proc/' + fields[0] + '/cmdline').read_bytes().split(b'\0')
+        if b'-config' not in args:
+            continue
+        address = args[args.index(b'-config') + 1].decode()
+        if address.startswith('@rwint-') and ':' in address:
+            candidates.append(address)
+    if len(candidates) != 1:
+        raise ValueError('No unique managed core')
+    name, path = candidates[0].split(':', 1)
+    if '\r' in path or '\n' in path:
+        raise ValueError('Invalid local endpoint')
+    with socket.socket(socket.AF_UNIX) as conn:
+        conn.settimeout(5)
+        conn.connect('\0' + name[1:])
+        conn.sendall(('GET ' + path + ' HTTP/1.0\r\nHost: localhost\r\n\r\n').encode())
+        res = http.client.HTTPResponse(conn)
+        res.begin()
+        if res.status != 200:
+            raise ValueError('Local endpoint unavailable')
+        data = res.read(16 * 1024 * 1024 + 1)
+        if len(data) > 16 * 1024 * 1024:
+            raise ValueError('Profile too large')
+        config = json.loads(data)
+        config = config.get('response', config)
+        # Remove accounts and all unrelated fields BEFORE writing to the pipe.
+        result = []
+        for inbound in config.get('inbounds', []):
+            if inbound.get('protocol') != 'hysteria':
+                continue
+            stream = inbound.get('streamSettings', {})
+            masq = stream.get('hysteriaSettings', {}).get('masquerade', {}) or {}
+            kind = masq.get('type', '')
+            configured = (kind == 'string' and bool(masq.get('content')) and masq.get('statusCode', 200) == 200) or \
+                         (kind == 'file' and bool(masq.get('dir'))) or \
+                         (kind == 'proxy' and bool(masq.get('url')) and not masq.get('insecure', False))
+            result.append({'bbr': stream.get('finalmask', {}).get('quicParams', {}).get('congestion') == 'bbr',
+                           'masquerade_configured': bool(configured)})
+        print(json.dumps(result))
+except Exception:
+    # No exceptions containing private URL, accounts or certificate material.
+    print('Managed profile cover inspection unavailable', file=sys.stderr)
+    raise SystemExit(2)
+PY
+}
+
+verify_hysteria_cover_contract() {
+  local summary="" state=""
+  if ! summary="$(read_live_profile_for_cover_check 2>/dev/null)"; then
+    HYSTERIA_COVER_STATUS=unknown
+    warn "HTTP/3-прикрытие: runtime-профиль прочитать не удалось; защита НЕ подтверждена."
+    return 0
+  fi
+  state="$(printf '%s' "$summary" | python3 -c '
+import json, sys
+items = json.load(sys.stdin)
+print("not-used" if not items else "configured" if all(x["bbr"] and x["masquerade_configured"] for x in items) else "pending-panel")
+')"
+  HYSTERIA_COVER_STATUS="$state"
+  case "$state" in
+    configured)
+      log "Hysteria: BBR и masquerade есть в runtime-профиле; внешний HTTP/3/VPN тест всё равно нужен."
+      ;;
+    not-used)
+      log "В активном профиле нет Hysteria; HTTP/3-прикрытие Hysteria не требуется."
+      ;;
+    *)
+      warn "Hysteria: BBR/masquerade в профиле НЕ подтверждены. Нода не меняет профиль мастер-панели автоматически."
+      warn "Готовый объект masquerade: $HYSTERIA_MASQUERADE_FILE — добавьте только в streamSettings.hysteriaSettings.masquerade нужных inbound-профилей."
+      ;;
+  esac
+}
+
 verify_node() {
   local deadline=$((SECONDS + 120))
   local logs=""
@@ -5318,6 +5515,7 @@ PY
     die "Docker healthcheck Node API получил статус unhealthy."
 
   verify_profile_transports
+  verify_hysteria_cover_contract
 
   log "Node verification OK: $xray_version; restart_count=$restarts_before"
   if (( PROFILE_VERIFIED == 0 )); then
@@ -5425,7 +5623,10 @@ print_profile_contract() {
   if bool_true "$ENABLE_XHTTP"; then
     printf '  STABLE-IN-443: VLESS/xHTTP, listen=%s,0666, path=%s\n' "$XHTTP_SOCKET" "$XHTTP_PATH"
     printf '  xHTTP edge:    TCP/443 TLS + HTTP/2 через Nginx; HTTP/3 на Nginx отключён\n'
+    printf '  HTTPS cover:   %s; HTTP 301, TLS 1.2/1.3, HSTS, собственная 404\n' "$COVER_ROOT"
   fi
+  printf '  Hysteria cover: %s; объект для профиля: %s\n' "$HYSTERIA_COVER_STATUS" "$HYSTERIA_MASQUERADE_FILE"
+  printf '  Прикрытие уменьшает явные признаки сервиса, но не гарантирует отсутствие блокировок.\n'
   if bool_true "$EXPECT_HYSTERIA"; then
     printf '  BBR-IN-443:    Hysteria 2 на UDP/%s, TLS из панели либо %s\n' "$HYSTERIA_PORT" "$TLS_DIR"
     printf '  Hysteria BBR:  finalmask.quicParams.congestion=bbr задаётся именно в JSON профиля\n'
@@ -5600,6 +5801,7 @@ run_install() {
   # The receiver stays inactive until this node has an individual token.
   # The monitoring panel never logs into nodes to transfer the IP list.
   install_ssh_peers_pull_module
+  write_cover_assets
   configure_xhttp_module
   install_rendered_files
   configure_xhttp_socket_guard
