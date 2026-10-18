@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.0.12"
+INSTALLER_VERSION="4.0.13"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -265,7 +265,7 @@ apt_log_path_for_attempt() {
   local label="$1"
   local dir=""
   dir="$(apt_log_dir)"
-  printf '%s/%s-%s-$$.log' "$dir" "$label" "$(date -u +%Y%m%dT%H%M%SZ)"
+  printf '%s/%s-%s-%s.log' "$dir" "$label" "$(date -u +%Y%m%dT%H%M%SZ)" "$$"
 }
 
 apt_output_contains_dns_error() {
@@ -1337,8 +1337,11 @@ collect_inputs() {
     XHTTP_DOMAIN="$(normalize_domain "$XHTTP_DOMAIN_INPUT")"
     if [[ -z "$XHTTP_DOMAIN" ]]; then
       bool_true "$YES" && die "Для xHTTP нужен XHTTP_DOMAIN."
-      ask 'Домен xHTTP: '
-      XHTTP_DOMAIN="$(normalize_domain "$PROMPT_VALUE")"
+      while [[ -z "$XHTTP_DOMAIN" ]]; do
+        ask 'Домен xHTTP: '
+        XHTTP_DOMAIN="$(normalize_domain "$PROMPT_VALUE")"
+        [[ -n "$XHTTP_DOMAIN" ]] || warn "Получена пустая строка. Введите только домен и нажмите Enter один раз."
+      done
     fi
     validate_xhttp
     if ! port_in_csv 80 "$PUBLIC_TCP_PORTS"; then
@@ -1560,7 +1563,9 @@ apt_retry() {
     fi
     log_path="$(apt_log_path_for_attempt "apt-${attempt}")"
     APT_LAST_LOG="$log_path"
-    if apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_TIMEOUT" -o APT::Update::Error-Mode=any "$@" 2>&1 | tee "$log_path"; then
+    if apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_TIMEOUT" -o APT::Update::Error-Mode=any \
+      -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+      "$@" 2>&1 | tee "$log_path"; then
       return 0
     else
       # Capture the failed pipeline here. `$?` AFTER `fi` is zero without an
@@ -1596,6 +1601,7 @@ install_base_packages() {
 
 ensure_docker() {
   local installer=""
+  local attempt=1 rc=0 apt_config="" docker_log=""
 
   if command -v docker >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
     die "Docker уже установлен без Compose plugin. Установите совместимый Docker Compose v2/v5 и повторите: существующий Engine автоматически не заменяю."
@@ -1609,9 +1615,30 @@ ensure_docker() {
 
   log "Устанавливаю Docker Engine и Compose plugin официальным способом"
   installer="$(mktemp /tmp/get-docker.XXXXXX.sh)"
-  curl --proto '=https' --tlsv1.2 -fsSL --retry 4 --retry-delay 3 https://get.docker.com -o "$installer"
-  sh "$installer"
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+    --connect-timeout 15 --max-time 120 --retry 3 --retry-delay 3 \
+    https://get.docker.com -o "$installer"
+  sh -n "$installer" || die "Получен некорректный Docker installer."
+  apt_config="$(mktemp /tmp/remnanode-docker-apt.XXXXXX)"
+  printf 'Acquire::Retries "2";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nDPkg::Lock::Timeout "%s";\nAPT::Update::Error-Mode "any";\n' \
+    "$APT_LOCK_TIMEOUT" >"$apt_config"
+  while (( attempt <= 3 )); do
+    docker_log="$(apt_log_path_for_attempt "docker-${attempt}")"
+    APT_LAST_LOG="$docker_log"
+    if APT_CONFIG="$apt_config" sh "$installer" 2>&1 | tee "$docker_log"; then
+      rc=0
+      break
+    else
+      rc=$?
+    fi
+    (( attempt == 3 )) && break
+    warn "Установка Docker прервана (код $rc); повтор $attempt/3. Репозитории ОС не подменяются."
+    sleep $((attempt * 4))
+    ((attempt++))
+  done
+  rm -f -- "$apt_config"
   rm -f "$installer"
+  (( rc == 0 )) || die "Docker не установлен после 3 попыток; точный лог: $docker_log"
   systemctl enable docker.service >/dev/null
   systemctl start docker.service
   docker info >/dev/null 2>&1 || die "Docker daemon недоступен после установки."
@@ -2192,6 +2219,10 @@ rollback_from_backup() {
   if [[ "$had_system_files" == "1" ]]; then
     tar -C / -xzf "$backup/system-files.tgz"
   fi
+  if [[ -f "$backup/web-permissions.acl" ]]; then
+    require_trusted_root_file "$backup/web-permissions.acl"
+    restore_web_permissions "$backup/web-permissions.acl" || rollback_failed=1
+  fi
 
   if command -v docker >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
     systemctl start docker.service >/dev/null 2>&1 || rollback_failed=1
@@ -2373,7 +2404,11 @@ rollback_from_backup() {
     warn "Rollback восстановил файлы, но одна или несколько служб не вернулись в ожидаемое состояние."
     return 1
   fi
-  log "Rollback завершён. Неудачная конфигурация сохранена в ${failed_copy_archive:-не создана}."
+  if [[ -n "$failed_copy_archive" ]]; then
+    log "Rollback завершён. Неудачная конфигурация сохранена в $failed_copy_archive."
+  else
+    log "Rollback завершён. Новая конфигурация ноды ещё не была создана."
+  fi
 }
 
 on_error() {
@@ -3953,6 +3988,155 @@ select_nginx_include_target() {
     die "Другой Nginx vhost уже использует server_name $XHTTP_DOMAIN; удалите конфликт перед установкой xHTTP."
 }
 
+prepare_public_web_parent() {
+  # GNU install can create intermediate parents under the caller's umask.
+  # Create /var/www explicitly before either public child (installer umask=027).
+  # Never chmod an existing shared parent or follow its symlink implicitly.
+  local web_parent="$(dirname "$COVER_ROOT")"
+  [[ ! -L "$web_parent" ]] || die "Public web parent не должен быть symlink: $web_parent"
+  if [[ ! -e "$web_parent" ]]; then
+    install -d -m 0755 "$web_parent"
+  fi
+  [[ -d "$web_parent" ]] || die "Public web parent не является каталогом: $web_parent"
+}
+
+restore_web_permissions() {
+  local snapshot="$1" path="" section="" filtered="" rc=0
+  command -v setfacl >/dev/null 2>&1 || return 1
+  filtered="$(mktemp /tmp/remnanode-acl-restore.XXXXXX)"
+  # Files created during a failed install may already have been removed by
+  # rollback. Restore only still-existing entries, never recreate those files.
+  if ! python3 - "$snapshot" "$filtered" <<'PY'
+import os, pathlib, sys
+source, target = map(pathlib.Path, sys.argv[1:])
+sections = source.read_text().split('\n\n')
+with target.open('w') as out:
+    for section in sections:
+        names = [line[8:] for line in section.splitlines() if line.startswith('# file: ')]
+        if len(names) == 1 and os.path.lexists(names[0]):
+            if os.path.islink(names[0]):
+                raise SystemExit('Refusing ACL restore through symlink')
+            out.write(section + '\n\n')
+PY
+  then
+    rm -f -- "$filtered"
+    return 1
+  fi
+  if [[ -s "$filtered" ]]; then
+    setfacl --restore="$filtered" || rc=$?
+  fi
+  rm -f -- "$filtered"
+  return "$rc"
+}
+
+nginx_worker_can_access() {
+  # Ubuntu's Rust coreutils test -x can ignore a named-user ACL. Check actual
+  # filesystem operations as the worker, not mode bits or root's access.
+  runuser -u "$1" -- python3 - "$2" "$3" <<'PY'
+import os, sys
+try:
+    if sys.argv[1] == 'x':
+        os.chdir(sys.argv[2])
+    elif sys.argv[1] == 'r':
+        fd = os.open(sys.argv[2], os.O_RDONLY | os.O_NOFOLLOW)
+        os.close(fd)
+    else:
+        raise ValueError('unsupported permission')
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+ensure_nginx_public_access() {
+  local worker="" path="" need="" mask="" acl="" snapshot=""
+  local -a paths=() needs=() denied=() denied_needs=()
+  worker="$(nginx -T 2>&1 | awk '!found && $1 == "user" {gsub(/;/, "", $2); print $2; found=1}')"
+  [[ "$worker" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]] && id "$worker" >/dev/null 2>&1 || \
+    die "Не удалось определить безопасного пользователя Nginx для проверки webroot."
+  for path in /var "$(dirname "$COVER_ROOT")" "$COVER_ROOT" "$NGINX_ACME_ROOT" \
+    "$NGINX_ACME_ROOT/.well-known" "$NGINX_ACME_ROOT/.well-known/acme-challenge"; do
+    [[ -d "$path" && ! -L "$path" ]] || die "Небезопасный или отсутствующий public web directory: $path"
+    paths+=("$path"); needs+=(x)
+  done
+  for path in "$COVER_ROOT/index.html" "$COVER_ROOT/404.html"; do
+    [[ -f "$path" && ! -L "$path" ]] || die "Небезопасный public cover file: $path"
+    paths+=("$path"); needs+=(r)
+  done
+  local i=0
+  for ((i=0; i<${#paths[@]}; i++)); do
+    if ! nginx_worker_can_access "$worker" "${needs[i]}" "${paths[i]}"; then
+      denied+=("${paths[i]}"); denied_needs+=("${needs[i]}")
+    fi
+  done
+  (( ${#denied[@]} > 0 )) || return 0
+  command -v getfacl >/dev/null 2>&1 && command -v setfacl >/dev/null 2>&1 || \
+    apt_retry install -y --no-install-recommends acl
+  [[ -d "$BACKUP_DIR" && -f "$BACKUP_DIR/SHA256SUMS" ]] || die "Нет backup для изменения доступа Nginx."
+  snapshot="$BACKUP_DIR/web-permissions.acl"
+  [[ ! -e "$snapshot" ]] || die "ACL snapshot уже существует; повторная мутация в одном запуске запрещена."
+  getfacl -p -- "${paths[@]}" >"$snapshot"
+  chmod 0600 "$snapshot"
+  (cd "$BACKUP_DIR" && sha256sum web-permissions.acl >>SHA256SUMS)
+  for ((i=0; i<${#denied[@]}; i++)); do
+    path="${denied[i]}"; need="${denied_needs[i]}"
+    nginx_worker_can_access "$worker" "$need" "$path" && continue
+    # Only grant the web worker minimum access. Never recursively chmod a
+    # shared root, and never widen an existing ACL mask for other principals.
+    acl="$(getfacl -cp -- "$path")"
+    mask="$(sed -n 's/^mask:://p' <<<"$acl")"
+    if [[ -n "$mask" && "$mask" != *"$need"* ]]; then
+      die "Существующий ACL mask запрещает $need на $path. Автоматически расширять чужие ACL небезопасно."
+    fi
+    if [[ -n "$mask" ]]; then
+      setfacl -n -m "u:$worker:$( [[ "$need" == x ]] && printf '%s' '--x' || printf '%s' 'r--' )" "$path"
+    else
+      setfacl -m "u:$worker:$( [[ "$need" == x ]] && printf '%s' '--x' || printf '%s' 'r--' )" "$path"
+    fi
+    log "Nginx: добавлен только доступ $need для $worker к $path (исходные ACL сохранены)."
+  done
+  for ((i=0; i<${#paths[@]}; i++)); do
+    nginx_worker_can_access "$worker" "${needs[i]}" "${paths[i]}" || \
+      die "Nginx всё ещё не имеет доступа к ${paths[i]}; запрос сертификата отменён."
+  done
+}
+
+verify_acme_http_path() (
+  # Subshell traps cannot replace the installer's rollback traps.
+  local probe="" body="" token="" code="" attempt=1
+  probe="$(mktemp "$NGINX_ACME_ROOT/.well-known/acme-challenge/rwnode-preflight.XXXXXX")"
+  body="$(mktemp /tmp/remnanode-acme-body.XXXXXX)"
+  trap 'rm -f -- "$probe" "$body"' EXIT
+  token="$(openssl rand -hex 24)"
+  printf '%s' "$token" >"$probe"
+  chmod 0644 "$probe"
+  while (( attempt <= 3 )); do
+    code="$(curl --noproxy '*' --proto '=http' -sS --connect-timeout 5 --max-time 10 \
+      --resolve "$XHTTP_DOMAIN:80:127.0.0.1" -o "$body" -w '%{http_code}' \
+      "http://$XHTTP_DOMAIN/.well-known/acme-challenge/$(basename "$probe")")" || code=000
+    if [[ "$code" == 200 ]] && [[ "$(cat "$body")" == "$token" ]]; then
+      log "ACME preflight: Nginx отдаёт проверочный файл HTTP 200 с правильным содержимым."
+      # The public path can legitimately be unavailable from inside a NAT.
+      # Diagnose it, but do not pretend an internal probe is external validation.
+      code="$(curl --noproxy '*' --proto '=http' -sS --connect-timeout 5 --max-time 12 \
+        -o "$body" -w '%{http_code}' \
+        "http://$XHTTP_DOMAIN/.well-known/acme-challenge/$(basename "$probe")")" || code=000
+      if [[ "$code" == 200 ]] && [[ "$(cat "$body")" == "$token" ]]; then
+        log "ACME preflight: домен также отдаёт правильный файл через публичный адрес."
+      elif [[ "$code" != 000 ]]; then
+        die "ACME через домен возвращает HTTP $code или чужое содержимое. Проверьте DNS/proxy; сертификат не запрашивался."
+      else
+        warn "Публичный HTTP self-check недоступен (маршрут/NAT); локальный файл проверен. Доступ извне проверит Let's Encrypt."
+      fi
+      return 0
+    fi
+    (( attempt == 3 )) && break
+    sleep 1
+    ((attempt++))
+  done
+  namei -l "$probe" >&2 || true
+  die "ACME preflight: локальный HTTP $code вместо правильного файла. Запрос Let's Encrypt не отправлен; смотрите Nginx error.log."
+)
+
 write_nginx_bootstrap_site() {
   local ipv6_http=""
   if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] && \
@@ -3969,6 +4153,9 @@ $ipv6_http
     location ^~ /.well-known/acme-challenge/ {
         root $NGINX_ACME_ROOT;
         default_type text/plain;
+        auth_basic off;
+        allow all;
+        try_files \$uri =404;
     }
 
     location / {
@@ -4126,6 +4313,7 @@ obtain_or_copy_certificate() {
     renewal_args=(--force-renewal)
   fi
   log "Получаю Let's Encrypt certificate для $XHTTP_DOMAIN"
+  verify_acme_http_path
   certbot certonly --webroot -w "$NGINX_ACME_ROOT" -d "$XHTTP_DOMAIN" \
     --cert-name "$XHTTP_DOMAIN" --non-interactive --agree-tos \
     --key-type ecdsa --elliptic-curve secp256r1 \
@@ -4260,6 +4448,7 @@ write_cover_assets() {
   # Existing custom pages in this dedicated directory are preserved.
   [[ ! -L "$COVER_ROOT" ]] || die "COVER_ROOT не должен быть symlink."
   [[ ! -L "$HYSTERIA_MASQUERADE_FILE" ]] || die "Masquerade export не должен быть symlink."
+  prepare_public_web_parent
   install -d -m 0755 "$COVER_ROOT"
   install -d -m 0700 "$STATE_DIR"
   python3 - "$COVER_ROOT" "$HYSTERIA_MASQUERADE_FILE" <<'PY'
@@ -4340,6 +4529,9 @@ $ipv6_http
     location ^~ /.well-known/acme-challenge/ {
         root $NGINX_ACME_ROOT;
         default_type text/plain;
+        auth_basic off;
+        allow all;
+        try_files \$uri =404;
     }
 
     location / {
@@ -4513,6 +4705,9 @@ configure_xhttp_module() {
   acquire_nginx_lock
   select_nginx_include_target
   tune_nginx_capacity
+  install -d -m 0755 "$NGINX_ACME_ROOT" "$NGINX_ACME_ROOT/.well-known" \
+    "$NGINX_ACME_ROOT/.well-known/acme-challenge"
+  ensure_nginx_public_access
   existing_le="$(find_usable_certbot_lineage "$XHTTP_DOMAIN" || true)"
 
   if [[ -n "$TLS_CERT_FILE" && -n "$TLS_KEY_FILE" ]]; then
@@ -4536,6 +4731,7 @@ configure_xhttp_module() {
     rm -f "$CERT_DEPLOY_HOOK"
   fi
   write_nginx_xhttp_site
+  verify_acme_http_path
   release_nginx_lock
 }
 
@@ -5309,23 +5505,41 @@ verify_profile_transports() {
   local hysteria_ready=1
   local listener_line=""
   local core_ready=0
+  local check_xhttp="$ENABLE_XHTTP" check_hysteria="$EXPECT_HYSTERIA"
+  local transports="" transport_kind="unknown"
+  local first_probe=1
 
   bool_true "$VERIFY_PROFILE_TRANSPORTS" || return 0
   PROFILE_VERIFIED=1
-  log "Проверяю runtime-пути профиля STABLE-IN-443 и Hysteria"
-
-  while (( SECONDS <= deadline )); do
+  if transports="$(read_live_profile_for_cover_check transports 2>/dev/null)"; then
+    transport_kind="$(printf '%s' "$transports" | python3 -c '
+import json,sys
+p=json.load(sys.stdin)
+print("hysteria-only" if p.get("hysteria",0)>0 and p.get("xhttp",0)==0 else "mixed" if p.get("hysteria",0)>0 else "other")
+')"
+    if [[ "$transport_kind" == hysteria-only ]]; then
+      check_xhttp=0
+      check_hysteria=1
+      log "Профиль панели использует Hysteria: Nginx работает как HTTPS-прикрытие; не требую отсутствующий VLESS/xHTTP socket."
+    elif [[ "$transport_kind" == mixed ]]; then
+      check_hysteria=1
+    fi
+  fi
+  log "Проверяю активные транспорты профиля: xHTTP=$check_xhttp Hysteria=$check_hysteria"
+  deadline=$((SECONDS + PROFILE_WAIT_SECONDS))
+  while (( first_probe == 1 || SECONDS <= deadline )); do
+    first_probe=0
     core_ready=0
     if [[ "$(docker exec remnanode /command/s6-svstat -o up /run/service/xray 2>/dev/null || true)" == true ]]; then
       core_ready=1
     fi
     xhttp_ready=1
     hysteria_ready=1
-    if bool_true "$ENABLE_XHTTP"; then
+    if bool_true "$check_xhttp"; then
       [[ -S "$XHTTP_SOCKET" ]] || xhttp_ready=0
       ss -H -ltn 'sport = :443' 2>/dev/null | grep -q . || xhttp_ready=0
     fi
-    if bool_true "$EXPECT_HYSTERIA"; then
+    if bool_true "$check_hysteria"; then
       udp_port_listening "$HYSTERIA_PORT" || hysteria_ready=0
     fi
     (( core_ready == 1 && xhttp_ready == 1 && hysteria_ready == 1 )) && break
@@ -5338,6 +5552,9 @@ verify_profile_transports() {
   if bool_true "$ENABLE_XHTTP"; then
     systemctl is-active --quiet nginx.service || die "Nginx для xHTTP не активен."
     nginx -t >/dev/null 2>&1 || die "Nginx xHTTP configuration не проходит nginx -t."
+    verify_local_tls_h2_alpn || die "Локальная TLS-проверка Nginx не согласовала HTTP/2 ALPN."
+  fi
+  if bool_true "$check_xhttp"; then
     if [[ ! -S "$XHTTP_SOCKET" ]]; then
       profile_not_ready "Нет $XHTTP_SOCKET: назначьте ноде профиль STABLE-IN-443 с listen=$XHTTP_SOCKET и path=$XHTTP_PATH."
     else
@@ -5348,10 +5565,9 @@ verify_profile_transports() {
       verify_local_xhttp_h2_edge || \
         profile_not_ready "Локальный Nginx→xHTTP socket self-test не получил ожидаемый HTTP 400 на $XHTTP_PATH."
     fi
-    verify_local_tls_h2_alpn || die "Локальная TLS-проверка xHTTP не согласовала HTTP/2 ALPN."
   fi
 
-  if bool_true "$EXPECT_HYSTERIA"; then
+  if bool_true "$check_hysteria"; then
     # Node 3.x may receive inline certificates from the panel. Host files are
     # therefore optional; a bound UDP socket is still NOT an authenticated test.
     udp_port_listening "$HYSTERIA_PORT" || \
@@ -5365,7 +5581,7 @@ verify_profile_transports() {
 
 read_live_profile_for_cover_check() {
   # Private in-memory pipe ONLY. Never save/print the raw profile or its users.
-  timeout 15 python3 - <<'PY'
+  timeout 15 python3 - "${1:-cover}" <<'PY'
 import http.client, json, socket, subprocess, sys
 from pathlib import Path
 try:
@@ -5400,6 +5616,13 @@ try:
             raise ValueError('Profile too large')
         config = json.loads(data)
         config = config.get('response', config)
+        if len(sys.argv) > 1 and sys.argv[1] == 'transports':
+            inbounds = config.get('inbounds', [])
+            print(json.dumps({
+                'hysteria': sum(i.get('protocol') == 'hysteria' for i in inbounds),
+                'xhttp': sum(i.get('streamSettings', {}).get('network') in ('xhttp', 'splithttp') for i in inbounds)
+            }))
+            raise SystemExit(0)
         # Remove accounts and all unrelated fields BEFORE writing to the pipe.
         result = []
         for inbound in config.get('inbounds', []):
