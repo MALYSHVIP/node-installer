@@ -2,12 +2,12 @@
 set -Eeuo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
-BOOTSTRAP_VERSION="1.1.4"
+BOOTSTRAP_VERSION="1.1.5"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 export INSTALLER_REPO INSTALLER_REF
 INSTALLER_FILE="${INSTALLER_FILE:-setup-remnanode.sh}"
-MIN_MAIN_INSTALLER_VERSION="4.0.12"
+MIN_MAIN_INSTALLER_VERSION="4.0.13"
 DOWNLOAD_ATTEMPTS=3
 TMP_FILE=""
 LOCAL_INSTALLER_USED=0
@@ -133,18 +133,15 @@ download_url() {
 
   if command -v curl >/dev/null 2>&1; then
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
-      --connect-timeout 15 --max-time 120 \
-      --retry 2 --retry-delay 2 --retry-max-time 240 \
-      -H 'Cache-Control: no-cache, no-store' \
-      -H 'Pragma: no-cache' \
+      --connect-timeout 15 --max-time 120 --retry 2 --retry-delay 2 --retry-max-time 240 \
+      -H 'Cache-Control: no-cache, no-store' -H 'Pragma: no-cache' \
       "$url" -o "$TMP_FILE"
     return $?
   fi
 
   if command -v wget >/dev/null 2>&1; then
     wget -q --https-only --timeout=30 --tries=3 --no-cache \
-      --header='Cache-Control: no-cache, no-store' \
-      --header='Pragma: no-cache' \
+      --header='Cache-Control: no-cache, no-store' --header='Pragma: no-cache' \
       -O "$TMP_FILE" "$url"
     return $?
   fi
@@ -165,22 +162,24 @@ download_installer() {
     nonce="$(date -u +%s 2>/dev/null || date +%s)-$$-${attempt}"
     url="${base_url}?bootstrap=${nonce}"
     : >"$TMP_FILE"
-
     if download_url "$url"; then
+      if [[ "$(head -n1 "$TMP_FILE")" != '#!/usr/bin/env bash' ]] || \
+         grep -Eq '^[[:space:]]*```' "$TMP_FILE"; then
+        log "downloaded file contains text/Markdown instead of a clean Bash script; retry=${attempt}/${DOWNLOAD_ATTEMPTS}"
+        ((attempt++))
+        continue
+      fi
       DOWNLOADED_VERSION="$(installer_version)"
-
       if expected_main_installer && \
          ! version_ge "$DOWNLOADED_VERSION" "$MIN_MAIN_INSTALLER_VERSION"; then
         log "stale installer version=${DOWNLOADED_VERSION:-unknown}; expected >=${MIN_MAIN_INSTALLER_VERSION}; retry=${attempt}/${DOWNLOAD_ATTEMPTS}"
         ((attempt++))
         continue
       fi
-
       DOWNLOADED_SHA256="$(installer_sha256)"
       log "downloaded version=${DOWNLOADED_VERSION:-unknown} sha256=${DOWNLOADED_SHA256:-unavailable} bytes=$(wc -c <"$TMP_FILE" | tr -d ' ')"
       return 0
     fi
-
     log "download failed; retry=${attempt}/${DOWNLOAD_ATTEMPTS}"
     ((attempt++))
   done
@@ -191,25 +190,20 @@ download_installer() {
 main() {
   local local_rc=0
   local bash_bin=""
-
   need_root
   trap cleanup EXIT
   log "bootstrap version=${BOOTSTRAP_VERSION}"
 
   run_local_installer "$@" || local_rc=$?
-
   if [[ "$LOCAL_INSTALLER_USED" == "1" ]]; then
     exit "$local_rc"
   fi
 
   TMP_FILE="$(mktemp /tmp/node-installer.sh.XXXXXX)"
   download_installer
-
   [[ -s "$TMP_FILE" ]] || die "downloaded installer is empty"
-
   bash_bin="$(current_bash)"
   "$bash_bin" -n "$TMP_FILE" || die "downloaded installer has invalid shell syntax"
-
   chmod 700 "$TMP_FILE"
   run_installer_script "$TMP_FILE" "$@"
 }
