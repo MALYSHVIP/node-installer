@@ -1,13 +1,18 @@
+Замени **весь файл `install.sh`** в GitHub этим кодом — версия **1.1.4**.
+
+Важно: это обновляет загрузчик. Ошибку скачивания пакета с `mirror.timeweb.ru` эта замена сама по себе не исправляет.
+
+```bash
 #!/usr/bin/env bash
 set -Eeuo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
-BOOTSTRAP_VERSION="1.1.3"
+BOOTSTRAP_VERSION="1.1.4"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 export INSTALLER_REPO INSTALLER_REF
 INSTALLER_FILE="${INSTALLER_FILE:-setup-remnanode.sh}"
-MIN_MAIN_INSTALLER_VERSION="4.0.10"
+MIN_MAIN_INSTALLER_VERSION="4.0.12"
 DOWNLOAD_ATTEMPTS=3
 TMP_FILE=""
 LOCAL_INSTALLER_USED=0
@@ -132,15 +137,15 @@ download_url() {
   local url="$1"
 
   if command -v curl >/dev/null 2>&1; then
-    curl --proto '=https' --tlsv1.2 -fsSL \
-      --connect-timeout 15 --retry 4 --retry-delay 2 \
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+      --connect-timeout 15 --max-time 120 --retry 2 --retry-delay 2 --retry-max-time 240 \
       -H 'Cache-Control: no-cache, no-store' -H 'Pragma: no-cache' \
       "$url" -o "$TMP_FILE"
     return $?
   fi
 
   if command -v wget >/dev/null 2>&1; then
-    wget -q --no-cache \
+    wget -q --https-only --timeout=30 --tries=3 --no-cache \
       --header='Cache-Control: no-cache, no-store' --header='Pragma: no-cache' \
       -O "$TMP_FILE" "$url"
     return $?
@@ -205,3 +210,4 @@ main() {
 if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
 fi
+```
