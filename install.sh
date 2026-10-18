@@ -1,8 +1,3 @@
-Замени **весь файл `install.sh`** в GitHub этим кодом — версия **1.1.4**.
-
-Важно: это обновляет загрузчик. Ошибку скачивания пакета с `mirror.timeweb.ru` эта замена сама по себе не исправляет.
-
-```bash
 #!/usr/bin/env bash
 set -Eeuo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
@@ -210,4 +205,3 @@ main() {
 if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
 fi
-```
