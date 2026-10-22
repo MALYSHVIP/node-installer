@@ -14,12 +14,11 @@
 
 ## Установка ноды
 
-DNS A-запись домена должна заранее указывать на IP ноды. Для интерактивной установки сначала скачайте bootstrap в файл, затем запустите его. Это обязательно на системах, где `sudo` использует собственный PTY: команда `curl | sudo bash` показывает вопросы, но не передаёт введённые ответы дочернему процессу.
+DNS A-запись домена должна заранее указывать на IP ноды. Интерактивный bootstrap поддерживает однострочный запуск через `curl | sudo bash`, включая системы, где `sudo` использует собственный PTY: установщик сам находит исходный SSH-терминал для ответов.
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh?ts=$(date +%s)" \
-  -o /tmp/remnanode-install.sh
-sudo env PANEL_IP='<MASTER_PANEL_IP>' bash /tmp/remnanode-install.sh
+curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | \
+sudo env PANEL_IP='<MASTER_PANEL_IP>' bash
 ```
 
 Установщик по очереди спросит, включать ли masked BBR, домен, включать ли одновременно xHTTP, а затем `SECRET_KEY`. Для совместного режима используется один домен: Hysteria занимает `UDP/443`, Nginx/xHTTP — `TCP/443`.

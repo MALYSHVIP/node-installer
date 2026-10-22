@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.1.1"
+INSTALLER_VERSION="4.1.2"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -103,6 +103,7 @@ MODE="install"
 YES="${YES:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 PROMPT_TIMEOUT="${PROMPT_TIMEOUT:-900}"
+PROMPT_INPUT_FD=""
 BACKUP_REQUEST="${BACKUP_REQUEST:-}"
 
 # Preserve the distinction between "unset" and an explicitly supplied default.
@@ -372,35 +373,81 @@ prepare_package_network() {
   return 1
 }
 
+open_prompt_input() {
+  local self_tty=""
+  local process_id=""
+  local parent_id=""
+  local candidate=""
+  local descriptor=""
+
+  if [[ -n "$PROMPT_INPUT_FD" && -e "/proc/$$/fd/$PROMPT_INPUT_FD" && -t "$PROMPT_INPUT_FD" ]]; then
+    return 0
+  fi
+  PROMPT_INPUT_FD=""
+
+  # With an ordinary invocation stdin already is the user's terminal.
+  if [[ "${NODE_INSTALLER_PIPE_INPUT:-0}" != "1" && -t 0 ]]; then
+    PROMPT_INPUT_FD=0
+    return 0
+  fi
+
+  # `curl | sudo bash` gives sudo a pipe on fd 0. With sudo use_pty, /dev/tty
+  # inside the command is sudo's private relay PTY, while the real SSH terminal
+  # remains attached to an ancestor. Walk only our own ancestor chain and open
+  # the first explicit terminal different from the private relay.
+  self_tty="$(readlink "/proc/$$/fd/0" 2>/dev/null || true)"
+  [[ "$self_tty" == /dev/pts/* || "$self_tty" == /dev/tty* ]] || \
+    self_tty="$(readlink "/proc/$$/fd/1" 2>/dev/null || true)"
+  process_id="$PPID"
+
+  while [[ "$process_id" =~ ^[0-9]+$ ]] && (( process_id > 1 )) && [[ -r "/proc/$process_id/status" ]]; do
+    for descriptor in 0 1 2; do
+      candidate="$(readlink "/proc/$process_id/fd/$descriptor" 2>/dev/null || true)"
+      case "$candidate" in
+        /dev/pts/[0-9]*|/dev/tty[0-9]*) ;;
+        *) continue ;;
+      esac
+      [[ "$candidate" != "$self_tty" && -c "$candidate" ]] || continue
+      if exec {PROMPT_INPUT_FD}<"$candidate"; then
+        if [[ -t "$PROMPT_INPUT_FD" ]]; then
+          return 0
+        fi
+        exec {PROMPT_INPUT_FD}<&-
+        PROMPT_INPUT_FD=""
+      fi
+    done
+    parent_id="$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$process_id/status" 2>/dev/null || true)"
+    [[ "$parent_id" != "$process_id" ]] || break
+    process_id="$parent_id"
+  done
+
+  # Direct `curl | bash` without sudo has no second PTY: the bootstrap already
+  # reconnected fd 0 to the correct controlling terminal.
+  if [[ -t 0 ]]; then
+    PROMPT_INPUT_FD=0
+    return 0
+  fi
+  if { exec {PROMPT_INPUT_FD}</dev/tty; } 2>/dev/null && [[ -t "$PROMPT_INPUT_FD" ]]; then
+    return 0
+  fi
+  PROMPT_INPUT_FD=""
+  return 1
+}
+
 ask() {
   local prompt="$1"
   local value=""
   local rc=0
 
-  if [[ "${NODE_INSTALLER_PIPE_INPUT:-0}" == "1" ]]; then
-    die "Интерактивный ввод через 'curl | sudo bash' недоступен на этом sudo/PTY. Скачайте install.sh в файл и запустите 'sudo bash /tmp/remnanode-install.sh' либо передайте все параметры через окружение и --yes."
-  fi
-
   [[ "$PROMPT_TIMEOUT" =~ ^[0-9]+$ ]] && (( PROMPT_TIMEOUT >= 1 && PROMPT_TIMEOUT <= 3600 )) || \
     die "PROMPT_TIMEOUT должен быть целым числом от 1 до 3600 секунд."
 
-  # The bootstrap reconnects the child installer stdin to the SSH PTY.  Prefer
-  # that ordinary stdin path: it works consistently in OpenSSH and mobile SSH
-  # clients and avoids keeping a dynamic /dev/tty descriptor across prompts.
-  # Every prompt is a complete, newline-terminated stderr line so a client that
-  # buffers incomplete terminal lines cannot hide the next question.
-  if [[ -t 0 ]]; then
-    printf '\n[INPUT] %s\n' "$prompt" >&2
-    IFS= read -r -t "$PROMPT_TIMEOUT" value || rc=$?
-  elif { : </dev/tty; } 2>/dev/null; then
-    # Keep prompts on stderr even when the reply must be read from /dev/tty.
-    # SSH clients always display stderr; writing the question to /dev/tty
-    # itself is less portable and was the source of invisible questions.
-    printf '\n[INPUT] %s\n' "$prompt" >&2
-    IFS= read -r -t "$PROMPT_TIMEOUT" value </dev/tty || rc=$?
-  else
-    die "Интерактивный ввод недоступен. Запустите команду из обычного SSH-терминала либо передайте параметры через PANEL_IP/PANEL_IPS, XHTTP_DOMAIN и SECRET_FILE."
-  fi
+  open_prompt_input || \
+    die "Не удалось открыть SSH-терминал для ввода. Передайте параметры через PANEL_IP/PANEL_IPS, XHTTP_DOMAIN и SECRET_FILE."
+  # Keep prompts on stderr: sudo relays it even though stdin carries the curl
+  # pipeline. Read replies directly from the resolved user terminal.
+  printf '\n[INPUT] %s\n' "$prompt" >&2
+  IFS= read -r -t "$PROMPT_TIMEOUT" -u "$PROMPT_INPUT_FD" value || rc=$?
 
   (( rc == 0 )) || die "Ввод не получен или прерван на запросе: $prompt (таймаут ${PROMPT_TIMEOUT}s)."
   PROMPT_VALUE="$value"
