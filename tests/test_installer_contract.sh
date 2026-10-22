@@ -8,6 +8,25 @@ esac
 # shellcheck disable=SC1091
 source "$repo_dir/setup-remnanode.sh"
 
+# Regression for the production failure where `docker ... version | head -n1`
+# closed stdout early and pipefail converted SIGPIPE into a fatal installer
+# error. The replacement must return the first line while draining all output.
+sigpipe_sensitive_producer() {
+  python3 - <<'PY'
+import os
+for number in range(1, 20001):
+    try:
+        os.write(1, f"line-{number}\n".encode())
+    except BrokenPipeError:
+        raise SystemExit(141)
+PY
+}
+[[ "$(sigpipe_sensitive_producer | first_line)" == "line-1" ]]
+if grep -F 'version | head -n1' "$repo_dir/setup-remnanode.sh" >/dev/null; then
+  printf 'unsafe version/head pipeline reintroduced\n' >&2
+  exit 1
+fi
+
 test_root="$(mktemp -d /tmp/remnanode-masked-bbr-test.XXXXXX)"
 trap 'rm -rf -- "$test_root"' EXIT
 STATE_DIR="$test_root/state"

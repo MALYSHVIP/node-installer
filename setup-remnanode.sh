@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.1.2"
+INSTALLER_VERSION="4.1.3"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -252,10 +252,17 @@ trim() {
   printf '%s' "$value"
 }
 
+# Print the first line but continue draining stdin. Unlike `head -n1`, this
+# cannot close a Docker/ss/systemctl producer early and turn a successful
+# command into SIGPIPE (141) under `set -o pipefail`.
+first_line() {
+  awk 'NR == 1 { first=$0 } END { if (NR > 0) print first }'
+}
+
 unit_known_to_systemd() {
   local unit="$1"
-  systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q . && return 0
-  systemctl list-units --all "$unit" --no-legend 2>/dev/null | grep -q . && return 0
+  systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep . >/dev/null && return 0
+  systemctl list-units --all "$unit" --no-legend 2>/dev/null | grep . >/dev/null && return 0
   return 1
 }
 
@@ -946,7 +953,7 @@ release_installer_lock() {
 version_ge() {
   local have="$1"
   local need="$2"
-  [[ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | head -n1)" == "$need" ]]
+  [[ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | first_line)" == "$need" ]]
 }
 
 free_mb_for_path() {
@@ -1317,9 +1324,9 @@ detect_existing_secret() {
   elif [[ -n "$SECRET_INPUT" ]]; then
     value="$SECRET_INPUT"
   elif [[ -r "$ENV_FILE" ]]; then
-    value="$(sed -n 's/^SECRET_KEY=//p' "$ENV_FILE" | head -n1)"
+    value="$(sed -n 's/^SECRET_KEY=//p' "$ENV_FILE" | first_line)"
   elif command -v docker >/dev/null 2>&1 && docker inspect remnanode >/dev/null 2>&1; then
-    value="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' remnanode 2>/dev/null | sed -n 's/^SECRET_KEY=//p' | head -n1)"
+    value="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' remnanode 2>/dev/null | sed -n 's/^SECRET_KEY=//p' | first_line)"
   fi
 
   value="$(trim "$value")"
@@ -2030,7 +2037,7 @@ create_backup() {
   fi
   [[ -e /swapfile-remnanode ]] && had_swap_file=1
   if command -v swapon >/dev/null 2>&1 && \
-     swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq /swapfile-remnanode; then
+     swapon --show=NAME --noheadings 2>/dev/null | grep -Fx /swapfile-remnanode >/dev/null; then
     was_swap_active=1
   fi
 
@@ -2134,9 +2141,9 @@ safe_positive_int() {
 
 primary_uplink_iface() {
   local iface=""
-  iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
+  iface="$(ip route show default 2>/dev/null | awk '/default/ && !found {print $5; found=1}')"
   if [[ -z "$iface" ]]; then
-    iface="$(ip -o link show up 2>/dev/null | awk -F': ' '$2 != "lo" {print $2; exit}')"
+    iface="$(ip -o link show up 2>/dev/null | awk -F': ' '$2 != "lo" && !found {print $2; found=1}')"
   fi
   printf '%s' "$iface"
 }
@@ -2144,7 +2151,7 @@ primary_uplink_iface() {
 iface_driver() {
   local iface="$1"
   [[ -n "$iface" ]] || return 0
-  ethtool -i "$iface" 2>/dev/null | awk -F': ' '/^driver:/ {print $2; exit}'
+  ethtool -i "$iface" 2>/dev/null | awk -F': ' '/^driver:/ && !found {print $2; found=1}'
 }
 
 adaptive_udp_mem_triplet() {
@@ -2378,7 +2385,7 @@ rollback_from_backup() {
   fi
 
   if [[ "$had_swap_file" == "0" ]]; then
-    if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq /swapfile-remnanode; then
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -Fx /swapfile-remnanode >/dev/null; then
       if swapoff /swapfile-remnanode >/dev/null 2>&1; then
         rm -f /swapfile-remnanode
       else
@@ -2389,7 +2396,7 @@ rollback_from_backup() {
       rm -f /swapfile-remnanode
     fi
   elif [[ "$was_swap_active" == "1" ]]; then
-    swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq /swapfile-remnanode || \
+    swapon --show=NAME --noheadings 2>/dev/null | grep -Fx /swapfile-remnanode >/dev/null || \
       swapon /swapfile-remnanode >/dev/null 2>&1 || rollback_failed=1
   fi
 
@@ -2445,7 +2452,7 @@ rollback_from_backup() {
   if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
     rollback_failed=1
   fi
-  if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
+  if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep '^Status: active' >/dev/null; then
     ufw reload >/dev/null 2>&1 || rollback_failed=1
   fi
   if systemctl is-active --quiet systemd-resolved.service 2>/dev/null; then
@@ -2624,7 +2631,7 @@ stop_legacy_units() {
   done < <(legacy_paths)
 
   for unit in "${units[@]}"; do
-    if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q .; then
+    if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep . >/dev/null; then
       LEGACY_DETECTED=1
       systemctl disable --now "$unit" >/dev/null 2>&1 || true
     fi
@@ -2722,7 +2729,7 @@ configure_small_swap() {
     return 0
   fi
 
-  if swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$swap_file"; then
+  if swapon --show=NAME --noheadings 2>/dev/null | grep -Fx "$swap_file" >/dev/null; then
     log "Swap $swap_file уже активен; не изменяю его на работающей системе."
     return 0
   fi
@@ -2823,7 +2830,7 @@ configure_minimal_sysctl() {
 
   if bool_true "$ENABLE_BBR"; then
     modprobe tcp_bbr >/dev/null 2>&1 || true
-    if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -w bbr >/dev/null; then
       bbr_available=1
       {
         printf 'net.core.default_qdisc = fq\n'
@@ -2892,9 +2899,9 @@ safe_positive_int() {
 
 primary_uplink_iface() {
   local iface=""
-  iface="\$(ip route show default 2>/dev/null | awk '/default/ {print \$5; exit}')"
+  iface="\$(ip route show default 2>/dev/null | awk '/default/ && !found {print \$5; found=1}')"
   if [[ -z "\$iface" ]]; then
-    iface="\$(ip -o link show up 2>/dev/null | awk -F': ' '\$2 != \"lo\" {print \$2; exit}')"
+    iface="\$(ip -o link show up 2>/dev/null | awk -F': ' '\$2 != \"lo\" && !found {print \$2; found=1}')"
   fi
   printf '%s' "\$iface"
 }
@@ -2902,7 +2909,7 @@ primary_uplink_iface() {
 iface_driver() {
   local iface="\$1"
   [[ -n "\$iface" ]] || return 0
-  ethtool -i "\$iface" 2>/dev/null | awk -F': ' '/^driver:/ {print \$2; exit}'
+  ethtool -i "\$iface" 2>/dev/null | awk -F': ' '/^driver:/ && !found {print \$2; found=1}'
 }
 
 adaptive_quic_runtime_profile() {
@@ -3073,10 +3080,10 @@ disk_used="\$(df -P / | awk 'NR == 2 {gsub(/%/, "", \$5); print \$5}')"
 if [[ "\$disk_used" =~ ^[0-9]+\$ ]] && (( disk_used >= 90 )); then
   logger -p daemon.warning -t remnanode-maintenance -- "root filesystem usage is \${disk_used}%"
 fi
-if ! docker inspect -f '{{.State.Running}}' remnanode 2>/dev/null | grep -qx true; then
+if ! docker inspect -f '{{.State.Running}}' remnanode 2>/dev/null | grep -x true >/dev/null; then
   logger -p daemon.warning -t remnanode-maintenance -- "remnanode container is not running; Docker restart policy remains responsible for recovery"
 fi
-if docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' remnanode 2>/dev/null | grep -qx unhealthy; then
+if docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' remnanode 2>/dev/null | grep -x unhealthy >/dev/null; then
   logger -p daemon.warning -t remnanode-maintenance -- "remnanode API healthcheck is unhealthy; no blind restart was performed"
 fi
 
@@ -3121,14 +3128,14 @@ cleanup_installer_ufw_rules() {
   local attempt=0
   local deleted=0
   command -v ufw >/dev/null 2>&1 || return 0
-  LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active' || return 0
+  LC_ALL=C ufw status 2>/dev/null | grep '^Status: active' >/dev/null || return 0
 
   while :; do
     if [[ -n "$keep_comment" ]]; then
       line="$(LC_ALL=C ufw status numbered 2>/dev/null | \
-        grep -F 'remnanode-installer' | grep -Fv "$keep_comment" | head -n1 || true)"
+        grep -F 'remnanode-installer' | grep -Fv "$keep_comment" | first_line || true)"
     else
-      line="$(LC_ALL=C ufw status numbered 2>/dev/null | grep -F 'remnanode-installer' | head -n1 || true)"
+      line="$(LC_ALL=C ufw status numbered 2>/dev/null | grep -F 'remnanode-installer' | first_line || true)"
     fi
     number="$(sed -n 's/^\[ *\([0-9][0-9]*\)\].*/\1/p' <<<"$line")"
     [[ -n "$number" ]] || break
@@ -3280,7 +3287,7 @@ nft -f "\$RULES"
 
 # nft is the primary safety boundary and is applied first. UFW is then kept in
 # sync because a later UFW base chain may otherwise still block public ports.
-if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
+if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep '^Status: active' >/dev/null; then
   for source in $PANEL_IPS; do
     if [[ "\$source" == *:* ]] && grep -Eq '^[[:space:]]*IPV6[[:space:]]*=[[:space:]]*(no|false|0)' /etc/default/ufw 2>/dev/null; then
       logger -p daemon.warning -t remnanode-firewall -- "skip IPv6 UFW rule while UFW IPv6 support is disabled: \$source"
@@ -3610,7 +3617,7 @@ collect_live_xray_dns() {
   "$TIMEOUT" 5 docker inspect remnanode >/dev/null 2>&1 || return 0
   pid="$("$TIMEOUT" 5 docker inspect -f '{{.State.Pid}}' remnanode 2>/dev/null || true)"
   [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || return 0
-  line="$("$TIMEOUT" 5 docker top remnanode -eo pid,args 2>/dev/null | awk '/\/usr\/local\/bin\/rw-core/ {print; exit}')"
+  line="$("$TIMEOUT" 5 docker top remnanode -eo pid,args 2>/dev/null | awk '/\/usr\/local\/bin\/rw-core/ && !found {print; found=1}')"
   [[ -n "$line" ]] || return 0
   sock="$(printf '%s\n' "$line" | sed -n 's/.*-config @\([^:]*\):\/internal\/get-config.*/\1/p')"
   token="$(printf '%s\n' "$line" | sed -n 's/.*token=\([A-Za-z0-9]*\).*/\1/p')"
@@ -4018,18 +4025,18 @@ install_ssh_peers_pull_module() {
 check_xhttp_port_conflicts() {
   local line=""
   command -v ss >/dev/null 2>&1 || return 0
-  line="$(ss -H -ltnp '( sport = :443 )' 2>/dev/null | head -n1 || true)"
+  line="$(ss -H -ltnp '( sport = :443 )' 2>/dev/null | first_line || true)"
   if [[ -n "$line" && "$line" != *nginx* ]]; then
     die "TCP/443 уже занят не Nginx: $line"
   fi
-  line="$(ss -H -ltnp '( sport = :80 )' 2>/dev/null | head -n1 || true)"
+  line="$(ss -H -ltnp '( sport = :80 )' 2>/dev/null | first_line || true)"
   if [[ -n "$line" && "$line" != *nginx* ]]; then
     die "TCP/80 уже занят не Nginx, Certbot webroot невозможен: $line"
   fi
 }
 
 hysteria_listener_line() {
-  ss -H -lunp "( sport = :$HYSTERIA_PORT )" 2>/dev/null | head -n1 || true
+  ss -H -lunp "( sport = :$HYSTERIA_PORT )" 2>/dev/null | first_line || true
 }
 
 hysteria_listener_is_expected() {
@@ -4543,7 +4550,7 @@ fi
 
 # Reload a currently running Node so Hysteria receives the renewed certificate.
 # Never start a deliberately stopped container; retry only transient failures.
-if docker inspect -f '{{.State.Running}}' remnanode 2>/dev/null | grep -qx true; then
+if docker inspect -f '{{.State.Running}}' remnanode 2>/dev/null | grep -x true >/dev/null; then
   restart_ok=0
   for attempt in 1 2 3; do
     if docker restart --time 45 remnanode >/dev/null; then
@@ -4560,7 +4567,7 @@ EOF
 
 ensure_certbot_renewal() {
   (( CERTBOT_MANAGED == 1 )) || return 0
-  if systemctl list-unit-files certbot.timer --no-legend 2>/dev/null | grep -q .; then
+  if systemctl list-unit-files certbot.timer --no-legend 2>/dev/null | grep . >/dev/null; then
     systemctl enable --now certbot.timer >/dev/null || \
       die "Не удалось включить certbot.timer; автоматическое продление TLS не гарантировано."
     return 0
@@ -5560,7 +5567,7 @@ prepare_hysteria_revocation_guard() {
     install -m 0600 "$CORE_FIX_BUILD_DIR/upstream-probe.json" "$BACKUP_DIR/core-revocation-error.log"
     die "Не удалось достоверно проверить Hysteria (код $rc). Работающая нода не будет заменена непроверенным ядром."
   fi
-  stock_version="$(docker run --rm --network none --entrypoint xray "$original_id" version | head -n1)"
+  stock_version="$(docker run --rm --network none --entrypoint xray "$original_id" version | first_line)"
   [[ "$stock_version" == *"Xray 26.7.28 "* && "$stock_version" =~ [[:space:]]5ca6f4b[[:space:]] ]] || \
     die "Обнаружена ошибка отзыва в неизвестном ядре: $stock_version. Автоматическое понижение версии запрещено; нужен патч для этой версии."
   key="${NODE_VERSION}-${original_id#sha256:}-$arch-${CORE_FIX_OVERLAY_SHA256:0:12}"
@@ -5761,12 +5768,12 @@ activate_node() {
 }
 
 port_listening() {
-  ss -H -ltn "sport = :$NODE_PORT" 2>/dev/null | grep -q .
+  ss -H -ltn "sport = :$NODE_PORT" 2>/dev/null | grep . >/dev/null
 }
 
 udp_port_listening() {
   local port="$1"
-  ss -H -lun "sport = :$port" 2>/dev/null | grep -q .
+  ss -H -lun "sport = :$port" 2>/dev/null | grep . >/dev/null
 }
 
 verify_native_plugins() {
@@ -5883,7 +5890,7 @@ print("hysteria-only" if p.get("hysteria",0)>0 and p.get("xhttp",0)==0 else "mix
     hysteria_ready=1
     if bool_true "$check_xhttp"; then
       [[ -S "$XHTTP_SOCKET" ]] || xhttp_ready=0
-      ss -H -ltn 'sport = :443' 2>/dev/null | grep -q . || xhttp_ready=0
+      ss -H -ltn 'sport = :443' 2>/dev/null | grep . >/dev/null || xhttp_ready=0
     fi
     if bool_true "$check_hysteria"; then
       udp_port_listening "$HYSTERIA_PORT" || hysteria_ready=0
@@ -6100,7 +6107,7 @@ PY
     fi
   fi
 
-  xray_version="$(docker exec remnanode rw-core version 2>/dev/null | head -n1 || true)"
+  xray_version="$(docker exec remnanode rw-core version 2>/dev/null | first_line || true)"
   [[ "$xray_version" =~ Xray[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+) ]] || die "Не удалось определить встроенный Xray."
   version_ge "${BASH_REMATCH[1]}" "$MIN_XRAY_VERSION" || die "Xray ${BASH_REMATCH[1]} старее $MIN_XRAY_VERSION."
   verify_core_revocation_guard_runtime
@@ -6188,15 +6195,15 @@ restore_security_timers_if_legacy() {
   [[ "$LEGACY_DETECTED" == "1" ]] || return 0
   for unit in apt-daily.service apt-daily-upgrade.service unattended-upgrades.service \
     apt-daily.timer apt-daily-upgrade.timer; do
-    systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q . || continue
+    systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep . >/dev/null || continue
     systemctl unmask "$unit" >/dev/null 2>&1 || true
   done
   for unit in apt-daily.timer apt-daily-upgrade.timer; do
-    systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q . || continue
+    systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep . >/dev/null || continue
     systemctl enable --now "$unit" >/dev/null 2>&1 || \
       warn "Не удалось вернуть системный security timer $unit."
   done
-  if systemctl list-unit-files unattended-upgrades.service --no-legend 2>/dev/null | grep -q .; then
+  if systemctl list-unit-files unattended-upgrades.service --no-legend 2>/dev/null | grep . >/dev/null; then
     unit_state="$(systemctl is-enabled unattended-upgrades.service 2>/dev/null || true)"
     if [[ "$unit_state" == "disabled" ]]; then
       systemctl enable unattended-upgrades.service >/dev/null 2>&1 || \
@@ -6279,7 +6286,7 @@ show_status() {
     restarts="$(docker inspect --format '{{.RestartCount}}' remnanode)"
     started="$(docker inspect --format '{{.State.StartedAt}}' remnanode)"
     health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' remnanode)"
-    xray="$(docker exec remnanode rw-core version 2>/dev/null | head -n1 || true)"
+    xray="$(docker exec remnanode rw-core version 2>/dev/null | first_line || true)"
     cap_eff="$(docker exec remnanode awk '/^CapEff:/ {print $2}' /proc/1/status 2>/dev/null || true)"
     if python3 - "$cap_eff" >/dev/null 2>&1 <<'PY'
 import sys
@@ -6335,7 +6342,7 @@ PY
     printf 'Legacy reboot:   not required\n'
   fi
   if command -v ss >/dev/null 2>&1; then
-    printf 'Control port:    %s\n' "$(ss -H -ltn "sport = :${NODE_PORT:-2222}" 2>/dev/null | grep -q . && echo listening || echo not-listening)"
+    printf 'Control port:    %s\n' "$(ss -H -ltn "sport = :${NODE_PORT:-2222}" 2>/dev/null | grep . >/dev/null && echo listening || echo not-listening)"
   fi
   if [[ -n "${XHTTP_SOCKET:-}" ]]; then
     printf 'xHTTP socket:    %s\n' "$([[ -S "$XHTTP_SOCKET" ]] && echo present || echo absent)"

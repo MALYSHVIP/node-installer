@@ -2,12 +2,12 @@
 set -Eeuo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
-BOOTSTRAP_VERSION="1.2.3"
+BOOTSTRAP_VERSION="1.2.4"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 export INSTALLER_REPO INSTALLER_REF
 INSTALLER_FILE="${INSTALLER_FILE:-setup-remnanode.sh}"
-MIN_MAIN_INSTALLER_VERSION="4.1.2"
+MIN_MAIN_INSTALLER_VERSION="4.1.3"
 DOWNLOAD_ATTEMPTS=3
 TMP_FILE=""
 LOCAL_INSTALLER_USED=0
@@ -122,7 +122,7 @@ expected_main_installer() {
 }
 
 installer_version() {
-  sed -n 's/^INSTALLER_VERSION="\([^"]*\)"$/\1/p' "$TMP_FILE" | head -n1
+  awk -F'"' '/^INSTALLER_VERSION="[^"]*"$/ && !found { print $2; found=1 }' "$TMP_FILE"
 }
 
 installer_sha256() {
