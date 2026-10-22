@@ -17,7 +17,7 @@
 DNS A-запись домена должна заранее указывать на IP ноды. Для интерактивной установки сначала скачайте bootstrap в файл, затем запустите его. Это обязательно на системах, где `sudo` использует собственный PTY: команда `curl | sudo bash` показывает вопросы, но не передаёт введённые ответы дочернему процессу.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh \
+curl -fsSL "https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh?ts=$(date +%s)" \
   -o /tmp/remnanode-install.sh
 sudo env PANEL_IP='<MASTER_PANEL_IP>' bash /tmp/remnanode-install.sh
 ```
@@ -29,7 +29,7 @@ sudo env PANEL_IP='<MASTER_PANEL_IP>' bash /tmp/remnanode-install.sh
 ```bash
 install -m 600 /dev/null /root/remnanode-secret.txt
 nano /root/remnanode-secret.txt
-curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | \
+curl -fsSL "https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh?ts=$(date +%s)" | \
 sudo env PANEL_IP='<MASTER_PANEL_IP>' MASKED_BBR_DOMAIN='node.example.com' \
 XHTTP_DOMAIN='node.example.com' SECRET_FILE='/root/remnanode-secret.txt' \
 bash -s -- install --yes
@@ -80,7 +80,7 @@ bash -s -- install --yes
 После применения профиля в панели повторите установщик со строгой проверкой живого runtime:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | \
+curl -fsSL "https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh?ts=$(date +%s)" | \
 sudo env PANEL_IP='<MASTER_PANEL_IP>' MASKED_BBR_DOMAIN='node.example.com' \
 XHTTP_DOMAIN='node.example.com' SECRET_FILE='/root/remnanode-secret.txt' \
 bash -s -- update --require-profile-ready --yes
@@ -113,7 +113,7 @@ bash -s -- update --require-profile-ready --yes
 Для установки только xHTTP без masked BBR используйте интерактивный запуск из скачанного файла либо полностью передайте параметры:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | \
+curl -fsSL "https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh?ts=$(date +%s)" | \
 sudo env PANEL_IP='<MASTER_PANEL_IP>' ENABLE_MASKED_BBR=0 \
 XHTTP_DOMAIN='node.example.com' SECRET_FILE='/root/remnanode-secret.txt' \
 bash -s -- install --yes
@@ -122,7 +122,7 @@ bash -s -- install --yes
 Для установки без masked BBR и xHTTP:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | \
+curl -fsSL "https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh?ts=$(date +%s)" | \
 sudo env PANEL_IP='<MASTER_PANEL_IP>' ENABLE_MASKED_BBR=0 ENABLE_XHTTP=0 \
 SECRET_FILE='/root/remnanode-secret.txt' bash -s -- install --yes
 ```
