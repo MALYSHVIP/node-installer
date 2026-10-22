@@ -73,4 +73,75 @@ grep -Fq 'server_name node.example.com;' "$test_root/nginx.conf"
 grep -Fq 'listen 443 ssl;' "$test_root/nginx.conf"
 ! grep -Eqi 'listen[^;]*(quic|udp)|Alt-Svc' "$test_root/nginx.conf"
 
+# UDP/443 Hysteria and TCP/443 xHTTP are independent sockets. In combined
+# mode the xHTTP vhost also provides the ordinary HTTPS cover on the same
+# domain; Nginx must still not claim UDP/QUIC.
+ENABLE_XHTTP=1
+EXPECT_HYSTERIA=1
+HYSTERIA_PORT=443
+XHTTP_DOMAIN="$MASKED_BBR_DOMAIN"
+XHTTP_PATH='/stable-in-443/'
+XHTTP_SOCKET='/dev/shm/xrxh-stable.socket'
+render_nginx_xhttp_site >"$test_root/nginx-combined.conf"
+grep -Fq '# remnanode-installer-managed-xhttp' "$test_root/nginx-combined.conf"
+grep -Fq 'server_name node.example.com;' "$test_root/nginx-combined.conf"
+grep -Fq 'location ^~ /stable-in-443/' "$test_root/nginx-combined.conf"
+grep -Fq 'grpc_pass unix:/dev/shm/xrxh-stable.socket;' "$test_root/nginx-combined.conf"
+! grep -Eqi 'listen[^;]*(quic|udp)|Alt-Svc' "$test_root/nginx-combined.conf"
+validate_settings
+
+if (XHTTP_DOMAIN='other.example.com'; validate_settings >/dev/null 2>&1); then
+  printf 'mismatched combined domains unexpectedly passed validation\n' >&2
+  exit 1
+fi
+
+if (NODE_INSTALLER_PIPE_INPUT=1; ask 'must fail instead of hanging' >/dev/null 2>&1); then
+  printf 'piped interactive input unexpectedly reached a prompt\n' >&2
+  exit 1
+fi
+
+# Reproduce the interactive choice sequence without touching the host: masked
+# BBR=yes, one domain, xHTTP=yes. The xHTTP edge must reuse that domain and
+# expose TCP/443 while Hysteria keeps UDP/443.
+(
+  load_saved_state() { :; }
+  detect_legacy_xhttp() { :; }
+  validate_existing_compose_overrides() { :; }
+  detect_existing_secret() { :; }
+  validate_secret_basic() { :; }
+  ask_bool() {
+    case "$1" in
+      *'masked BBR'*|*'также xHTTP'*) PROMPT_VALUE=1 ;;
+      *) printf 'unexpected boolean prompt: %s\n' "$1" >&2; exit 1 ;;
+    esac
+  }
+  ask() {
+    case "$1" in
+      *'Домен masked BBR'*) PROMPT_VALUE='node.example.com' ;;
+      *) printf 'unexpected text prompt: %s\n' "$1" >&2; exit 1 ;;
+    esac
+  }
+  ask_secret() { PROMPT_VALUE='test-secret-not-validated'; }
+
+  YES=0
+  PANEL_IPS_INPUT='144.31.1.170'
+  PANEL_IPS=''
+  ENABLE_MASKED_BBR=auto
+  MASKED_BBR_DOMAIN_INPUT=''
+  MASKED_BBR_DOMAIN=''
+  ENABLE_XHTTP=auto
+  XHTTP_DOMAIN_INPUT=''
+  XHTTP_DOMAIN=''
+  EXPECT_HYSTERIA=0
+  SECRET_VALUE=''
+  PUBLIC_TCP_PORTS='80,443'
+  PUBLIC_UDP_PORTS='443'
+  collect_inputs
+  bool_true "$ENABLE_MASKED_BBR"
+  bool_true "$ENABLE_XHTTP"
+  bool_true "$EXPECT_HYSTERIA"
+  [[ "$MASKED_BBR_DOMAIN" == 'node.example.com' ]]
+  [[ "$XHTTP_DOMAIN" == "$MASKED_BBR_DOMAIN" ]]
+)
+
 printf 'masked-BBR installer contract tests: OK\n'

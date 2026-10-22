@@ -8,26 +8,31 @@
 - `disablePathMTUDiscovery=true` для мобильных сетей;
 - Salamander с индивидуальным случайным паролем;
 - без `packetSize`/GECKO, потому что этот вариант не прошёл LTE-проверку;
-- обычное HTTPS-прикрытие на `TCP/443` и автоматическое продление TLS;
+- одновременный xHTTP через Nginx на `TCP/443` либо обычное HTTPS-прикрытие;
+- автоматическое продление TLS;
 - штатные offload/qdisc не отключаются.
 
 ## Установка ноды
 
-DNS A-запись домена должна заранее указывать на IP ноды. Запускать на самой ноде под `root`:
+DNS A-запись домена должна заранее указывать на IP ноды. Для интерактивной установки сначала скачайте bootstrap в файл, затем запустите его. Это обязательно на системах, где `sudo` использует собственный PTY: команда `curl | sudo bash` показывает вопросы, но не передаёт введённые ответы дочернему процессу.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | \
-sudo env PANEL_IP='<MASTER_PANEL_IP>' MASKED_BBR_DOMAIN='node.example.com' bash
+curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh \
+  -o /tmp/remnanode-install.sh
+sudo env PANEL_IP='<MASTER_PANEL_IP>' bash /tmp/remnanode-install.sh
 ```
 
-Установщик запросит `SECRET_KEY`. Для полностью неинтерактивного запуска сохраните ключ в root-only файле и передайте `SECRET_FILE`:
+Установщик по очереди спросит, включать ли masked BBR, домен, включать ли одновременно xHTTP, а затем `SECRET_KEY`. Для совместного режима используется один домен: Hysteria занимает `UDP/443`, Nginx/xHTTP — `TCP/443`.
+
+Для полностью неинтерактивного запуска сохраните ключ в root-only файле и передайте `SECRET_FILE`. Здесь оба транспорта включаются на одном домене:
 
 ```bash
 install -m 600 /dev/null /root/remnanode-secret.txt
 nano /root/remnanode-secret.txt
 curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | \
 sudo env PANEL_IP='<MASTER_PANEL_IP>' MASKED_BBR_DOMAIN='node.example.com' \
-SECRET_FILE='/root/remnanode-secret.txt' bash
+XHTTP_DOMAIN='node.example.com' SECRET_FILE='/root/remnanode-secret.txt' \
+bash -s -- install --yes
 ```
 
 Во время установки создаются:
@@ -77,7 +82,8 @@ SECRET_FILE='/root/remnanode-secret.txt' bash
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | \
 sudo env PANEL_IP='<MASTER_PANEL_IP>' MASKED_BBR_DOMAIN='node.example.com' \
-SECRET_FILE='/root/remnanode-secret.txt' bash -s -- update --require-profile-ready --yes
+XHTTP_DOMAIN='node.example.com' SECRET_FILE='/root/remnanode-secret.txt' \
+bash -s -- update --require-profile-ready --yes
 ```
 
 Проверка читает только обезличенные признаки активного runtime-профиля и подтверждает:
@@ -93,20 +99,32 @@ SECRET_FILE='/root/remnanode-secret.txt' bash -s -- update --require-profile-rea
 
 После этого всё равно нужен внешний тест из HAPP по Wi‑Fi и LTE: сайты, видео, скачивание и отправка файла. Локальная проверка сервера не может доказать работу конкретной мобильной сети.
 
-## Обычный xHTTP или legacy-режим
+## Совместный xHTTP и masked BBR
 
-Masked BBR и managed xHTTP нельзя включать одновременно на одной ноде. Для xHTTP используйте прежний режим:
+Рабочий совместный режим использует разные сетевые протоколы на одном номере порта:
+
+- masked BBR/Hysteria 2 — `UDP/443`;
+- xHTTP/Nginx — `TCP/443`;
+- сертификат, SNI и домен у них общие;
+- Nginx не включает QUIC/HTTP/3 и не перехватывает Hysteria UDP.
+
+В мастер-панели профиль ноды должен содержать оба соответствующих inbound. Установщик готовит ноду и проверяет runtime, но не добавляет inbound в мастер-панель самостоятельно.
+
+Для установки только xHTTP без masked BBR используйте интерактивный запуск из скачанного файла либо полностью передайте параметры:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | \
-sudo env PANEL_IP='<MASTER_PANEL_IP>' XHTTP_DOMAIN='node.example.com' bash
+sudo env PANEL_IP='<MASTER_PANEL_IP>' ENABLE_MASKED_BBR=0 \
+XHTTP_DOMAIN='node.example.com' SECRET_FILE='/root/remnanode-secret.txt' \
+bash -s -- install --yes
 ```
 
-Для установки без masked BBR:
+Для установки без masked BBR и xHTTP:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MALYSHVIP/node-installer/main/install.sh | \
-sudo env PANEL_IP='<MASTER_PANEL_IP>' ENABLE_MASKED_BBR=0 bash
+sudo env PANEL_IP='<MASTER_PANEL_IP>' ENABLE_MASKED_BBR=0 ENABLE_XHTTP=0 \
+SECRET_FILE='/root/remnanode-secret.txt' bash -s -- install --yes
 ```
 
 ## Файлы репозитория

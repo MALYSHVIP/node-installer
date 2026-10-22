@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.1.0"
+INSTALLER_VERSION="4.1.1"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -376,6 +376,10 @@ ask() {
   local prompt="$1"
   local value=""
   local rc=0
+
+  if [[ "${NODE_INSTALLER_PIPE_INPUT:-0}" == "1" ]]; then
+    die "Интерактивный ввод через 'curl | sudo bash' недоступен на этом sudo/PTY. Скачайте install.sh в файл и запустите 'sudo bash /tmp/remnanode-install.sh' либо передайте все параметры через окружение и --yes."
+  fi
 
   [[ "$PROMPT_TIMEOUT" =~ ^[0-9]+$ ]] && (( PROMPT_TIMEOUT >= 1 && PROMPT_TIMEOUT <= 3600 )) || \
     die "PROMPT_TIMEOUT должен быть целым числом от 1 до 3600 секунд."
@@ -1104,9 +1108,10 @@ validate_settings() {
     [[ "$HYSTERIA_PORT" == 443 ]] || die "Проверенная masked-BBR схема требует HYSTERIA_PORT=443."
     bool_true "$ENABLE_QUIC_TUNING" && \
       die "Masked BBR несовместим с принудительным --quic-tuning: рабочая схема сохраняет штатные offload/qdisc."
-    bool_true "$ENABLE_XHTTP" && \
-      die "На одной ноде нельзя одновременно включать managed xHTTP и masked BBR: выберите один transport."
     validate_domain "$MASKED_BBR_DOMAIN" || die "Некорректный MASKED_BBR_DOMAIN: $MASKED_BBR_DOMAIN"
+    if bool_true "$ENABLE_XHTTP" && [[ "$XHTTP_DOMAIN" != "$MASKED_BBR_DOMAIN" ]]; then
+      die "Совместный masked BBR + xHTTP должен использовать один домен: UDP/443 обслуживает Hysteria, TCP/443 — Nginx/xHTTP."
+    fi
   fi
   [[ "$STABILITY_SECONDS" =~ ^[0-9]{1,3}$ ]] || die "STABILITY_SECONDS должен быть числом."
   STABILITY_SECONDS=$((10#$STABILITY_SECONDS))
@@ -1382,12 +1387,6 @@ collect_inputs() {
   if bool_true "$ENABLE_MASKED_BBR"; then
     EXPECT_HYSTERIA=1
     [[ -n "$ENABLE_QUIC_TUNING_EXPLICIT" ]] || ENABLE_QUIC_TUNING=0
-    if [[ -n "$XHTTP_DOMAIN_INPUT" && "$ENABLE_XHTTP" == auto ]]; then
-      die "Одновременно заданы MASKED_BBR_DOMAIN и XHTTP_DOMAIN; выберите один transport."
-    fi
-    if [[ "$ENABLE_XHTTP" == "auto" ]]; then
-      ENABLE_XHTTP=0
-    fi
     MASKED_BBR_DOMAIN="$(normalize_domain "$MASKED_BBR_DOMAIN_INPUT")"
     if [[ -z "$MASKED_BBR_DOMAIN" ]]; then
       bool_true "$YES" && die "Для masked BBR нужен MASKED_BBR_DOMAIN."
@@ -1398,9 +1397,6 @@ collect_inputs() {
       done
     fi
     validate_domain "$MASKED_BBR_DOMAIN" || die "Некорректный MASKED_BBR_DOMAIN: $MASKED_BBR_DOMAIN"
-    # Certificate/ordinary HTTPS cover helpers use this internal edge-domain.
-    # SAVED_XHTTP_DOMAIN remains empty, so an upgrade cannot enable xHTTP by accident.
-    XHTTP_DOMAIN="$MASKED_BBR_DOMAIN"
     for required_port in 80 443; do
       if ! port_in_csv "$required_port" "$PUBLIC_TCP_PORTS"; then
         [[ -n "$PUBLIC_TCP_PORTS" ]] && PUBLIC_TCP_PORTS="$required_port,$PUBLIC_TCP_PORTS" || PUBLIC_TCP_PORTS="$required_port"
@@ -1417,12 +1413,15 @@ collect_inputs() {
     elif bool_true "$YES"; then
       ENABLE_XHTTP=0
     else
-      ask_bool 'Настроить xHTTP через Nginx/TLS? [y/д/N/н]'
+      ask_bool 'Настроить также xHTTP через Nginx/TLS? [y/д/N/н]'
       ENABLE_XHTTP="$PROMPT_VALUE"
     fi
   fi
 
   if bool_true "$ENABLE_XHTTP"; then
+    if [[ -z "$XHTTP_DOMAIN_INPUT" ]] && bool_true "$ENABLE_MASKED_BBR"; then
+      XHTTP_DOMAIN_INPUT="$MASKED_BBR_DOMAIN"
+    fi
     XHTTP_DOMAIN="$(normalize_domain "$XHTTP_DOMAIN_INPUT")"
     if [[ -z "$XHTTP_DOMAIN" ]]; then
       bool_true "$YES" && die "Для xHTTP нужен XHTTP_DOMAIN."
@@ -1433,6 +1432,9 @@ collect_inputs() {
       done
     fi
     validate_xhttp
+    if bool_true "$ENABLE_MASKED_BBR" && [[ "$XHTTP_DOMAIN" != "$MASKED_BBR_DOMAIN" ]]; then
+      die "Для совместного masked BBR + xHTTP укажите один и тот же домен."
+    fi
     if ! port_in_csv 80 "$PUBLIC_TCP_PORTS"; then
       if [[ -n "$PUBLIC_TCP_PORTS" ]]; then
         PUBLIC_TCP_PORTS="80,$PUBLIC_TCP_PORTS"
@@ -1447,7 +1449,11 @@ collect_inputs() {
         PUBLIC_TCP_PORTS="443"
       fi
     fi
-  elif ! bool_true "$ENABLE_MASKED_BBR"; then
+  elif bool_true "$ENABLE_MASKED_BBR"; then
+    # Certificate and ordinary HTTPS-cover helpers share this edge domain even
+    # when the optional xHTTP location is disabled.
+    XHTTP_DOMAIN="$MASKED_BBR_DOMAIN"
+  else
     XHTTP_DOMAIN=""
   fi
 
@@ -4981,7 +4987,9 @@ configure_xhttp_module() {
     return 0
   fi
 
-  if bool_true "$ENABLE_MASKED_BBR"; then
+  if bool_true "$ENABLE_MASKED_BBR" && bool_true "$ENABLE_XHTTP"; then
+    log "Настраиваю совместный edge: Hysteria masked BBR на UDP/443 и xHTTP через Nginx на TCP/443"
+  elif bool_true "$ENABLE_MASKED_BBR"; then
     log "Настраиваю TLS и обычное HTTPS-прикрытие для masked BBR; UDP/443 остаётся у Hysteria"
   else
     log "Настраиваю optional xHTTP module без HTTP/3 и без подмен RemnaNode"
@@ -5017,10 +5025,10 @@ configure_xhttp_module() {
   else
     rm -f "$CERT_DEPLOY_HOOK"
   fi
-  if bool_true "$ENABLE_MASKED_BBR"; then
-    write_nginx_masked_bbr_site
-  else
+  if bool_true "$ENABLE_XHTTP"; then
     write_nginx_xhttp_site
+  else
+    write_nginx_masked_bbr_site
   fi
   verify_acme_http_path
   release_nginx_lock

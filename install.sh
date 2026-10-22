@@ -2,12 +2,12 @@
 set -Eeuo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
-BOOTSTRAP_VERSION="1.2.0"
+BOOTSTRAP_VERSION="1.2.1"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 export INSTALLER_REPO INSTALLER_REF
 INSTALLER_FILE="${INSTALLER_FILE:-setup-remnanode.sh}"
-MIN_MAIN_INSTALLER_VERSION="4.1.0"
+MIN_MAIN_INSTALLER_VERSION="4.1.1"
 DOWNLOAD_ATTEMPTS=3
 TMP_FILE=""
 LOCAL_INSTALLER_USED=0
@@ -192,6 +192,15 @@ main() {
   local bash_bin=""
   need_root
   trap cleanup EXIT
+  # `curl ... | sudo bash` gives sudo a pipe as stdin. On hosts where sudo
+  # uses an intermediate PTY, output is relayed but replies typed by the user
+  # are not forwarded to the child PTY. Preserve that fact across the exec so
+  # the installer fails with a useful command instead of appearing to hang.
+  if [[ ! -t 0 ]]; then
+    export NODE_INSTALLER_PIPE_INPUT=1
+  else
+    unset NODE_INSTALLER_PIPE_INPUT
+  fi
   log "bootstrap version=${BOOTSTRAP_VERSION}"
 
   run_local_installer "$@" || local_rc=$?
