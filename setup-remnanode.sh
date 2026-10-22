@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.0.13"
+INSTALLER_VERSION="4.1.0"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -95,6 +95,8 @@ NGINX_CAPACITY_DROPIN="/etc/systemd/system/nginx.service.d/60-remnanode-capacity
 NGINX_LOCK_FILE="/run/lock/remnanode-nginx.lock"
 COVER_ROOT="/var/www/remnanode-cover"
 HYSTERIA_MASQUERADE_FILE="$STATE_DIR/hysteria-masquerade.json"
+MASKED_BBR_CONTRACT_FILE="$STATE_DIR/masked-bbr-contract.json"
+MASKED_BBR_PASSWORD_FILE="$STATE_DIR/masked-bbr-password"
 HYSTERIA_COVER_STATUS="not-checked"
 
 MODE="install"
@@ -108,6 +110,7 @@ NODE_VERSION_EXPLICIT="${NODE_VERSION+x}"
 NODE_IMAGE_EXPLICIT="${NODE_IMAGE+x}"
 NODE_PORT_EXPLICIT="${NODE_PORT+x}"
 ENABLE_XHTTP_EXPLICIT="${ENABLE_XHTTP+x}"
+ENABLE_MASKED_BBR_EXPLICIT="${ENABLE_MASKED_BBR+x}"
 XHTTP_PATH_EXPLICIT="${XHTTP_PATH+x}"
 XHTTP_SOCKET_EXPLICIT="${XHTTP_SOCKET+x}"
 MANAGE_FIREWALL_EXPLICIT="${MANAGE_FIREWALL+x}"
@@ -139,6 +142,8 @@ SECRET_INPUT="${SECRET_KEY:-}"
 
 ENABLE_XHTTP="${ENABLE_XHTTP:-auto}"
 XHTTP_DOMAIN_INPUT="${XHTTP_DOMAIN:-}"
+ENABLE_MASKED_BBR="${ENABLE_MASKED_BBR:-auto}"
+MASKED_BBR_DOMAIN_INPUT="${MASKED_BBR_DOMAIN:-}"
 XHTTP_PATH="${XHTTP_PATH:-/stable-in-443/}"
 XHTTP_SOCKET="${XHTTP_SOCKET:-/dev/shm/xrxh-stable.socket}"
 LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
@@ -181,6 +186,7 @@ INSTALLER_REPLACE_TIMEOUT="${INSTALLER_REPLACE_TIMEOUT:-90}"
 
 PANEL_IPS=""
 XHTTP_DOMAIN=""
+MASKED_BBR_DOMAIN=""
 SECRET_VALUE=""
 SELECTED_IMAGE=""
 SELECTED_IMAGE_ID=""
@@ -435,6 +441,9 @@ Options:
   --node-port PORT          Control API port, default: 2222
   --node-version VERSION    Pinned stable Node 3.x version, default: 3.4.2
   --image IMAGE             Official image override
+  --masked-bbr-domain DOMAIN
+                             Hysteria 2 + TLS/H3 + BBR + Salamander (без GECKO)
+  --no-masked-bbr           Не создавать/не требовать masked-BBR contract
   --xhttp-domain DOMAIN     Настроить Nginx/TLS для xHTTP
   --xhttp-path PATH         Default: /stable-in-443/
   --xhttp-socket PATH       Default: /dev/shm/xrxh-stable.socket
@@ -483,6 +492,10 @@ Backups contain secrets: keep /var/backups/remnanode private (root only).
 Rollback restores managed configuration/image; it does not downgrade OS packages.
 
 Cover protection:
+  Masked BBR: Hysteria 2 over UDP/443, TLS ALPN h3, BBR, plain Salamander,
+  disablePathMTUDiscovery=true and NO packetSize/GECKO fragmentation.
+  A root-only master-panel merge contract is saved at:
+    /var/lib/remnanode-installer/masked-bbr-contract.json
   xHTTP/Nginx: public page + custom 404, HTTP 301, TLS 1.2/1.3 and HSTS.
   UDP/443 stays with Hysteria; Nginx does not claim QUIC or advertise Alt-Svc.
   Hysteria masquerade is controlled by the MASTER-PANEL profile, not .env.
@@ -538,6 +551,21 @@ parse_args() {
         NODE_IMAGE_INPUT="$2"
         NODE_IMAGE_EXPLICIT=1
         shift 2
+        ;;
+      --masked-bbr-domain)
+        need_arg "$@"
+        MASKED_BBR_DOMAIN_INPUT="$2"
+        ENABLE_MASKED_BBR=1
+        ENABLE_MASKED_BBR_EXPLICIT=1
+        EXPECT_HYSTERIA=1
+        EXPECT_HYSTERIA_EXPLICIT=1
+        shift 2
+        ;;
+      --no-masked-bbr)
+        ENABLE_MASKED_BBR=0
+        ENABLE_MASKED_BBR_EXPLICIT=1
+        MASKED_BBR_DOMAIN_INPUT=""
+        shift
         ;;
       --xhttp-domain)
         need_arg "$@"
@@ -1054,7 +1082,7 @@ port_in_csv() {
 
 validate_settings() {
   local setting=""
-  for setting in YES DRY_RUN ENABLE_XHTTP MANAGE_FIREWALL BLOCK_SMTP_EGRESS \
+  for setting in YES DRY_RUN ENABLE_XHTTP ENABLE_MASKED_BBR MANAGE_FIREWALL BLOCK_SMTP_EGRESS \
     BLOCK_SMTP_FORWARD ENABLE_SPAMHAUS_EGRESS_GUARD ENABLE_OUTBOUND_SSH_GUARD \
     ENABLE_DNS_REFLECTION_GUARD ENABLE_BITTORRENT_GUARD ENABLE_BBR AUTO_SWAP \
     ENABLE_MAINTENANCE ENABLE_QUIC_TUNING REQUIRE_NODE_PLUGINS \
@@ -1070,6 +1098,15 @@ validate_settings() {
   fi
   if bool_true "$REQUIRE_PROFILE_READY" && ! bool_true "$VERIFY_PROFILE_TRANSPORTS"; then
     die "REQUIRE_PROFILE_READY требует VERIFY_PROFILE_TRANSPORTS=1."
+  fi
+  if bool_true "$ENABLE_MASKED_BBR"; then
+    bool_true "$EXPECT_HYSTERIA" || die "Masked BBR требует EXPECT_HYSTERIA=1."
+    [[ "$HYSTERIA_PORT" == 443 ]] || die "Проверенная masked-BBR схема требует HYSTERIA_PORT=443."
+    bool_true "$ENABLE_QUIC_TUNING" && \
+      die "Masked BBR несовместим с принудительным --quic-tuning: рабочая схема сохраняет штатные offload/qdisc."
+    bool_true "$ENABLE_XHTTP" && \
+      die "На одной ноде нельзя одновременно включать managed xHTTP и masked BBR: выберите один transport."
+    validate_domain "$MASKED_BBR_DOMAIN" || die "Некорректный MASKED_BBR_DOMAIN: $MASKED_BBR_DOMAIN"
   fi
   [[ "$STABILITY_SECONDS" =~ ^[0-9]{1,3}$ ]] || die "STABILITY_SECONDS должен быть числом."
   STABILITY_SECONDS=$((10#$STABILITY_SECONDS))
@@ -1143,9 +1180,14 @@ load_saved_state() {
   fi
 
   [[ -n "$PANEL_IPS_INPUT" ]] || PANEL_IPS_INPUT="${SAVED_PANEL_IPS:-}"
-  [[ -n "$XHTTP_DOMAIN_INPUT" ]] || XHTTP_DOMAIN_INPUT="${SAVED_XHTTP_DOMAIN:-}"
+  if [[ -z "$XHTTP_DOMAIN_INPUT" && -z "$ENABLE_XHTTP_EXPLICIT" ]] && \
+     bool_true "${SAVED_ENABLE_XHTTP:-0}"; then
+    XHTTP_DOMAIN_INPUT="${SAVED_XHTTP_DOMAIN:-}"
+  fi
+  [[ -n "$MASKED_BBR_DOMAIN_INPUT" ]] || MASKED_BBR_DOMAIN_INPUT="${SAVED_MASKED_BBR_DOMAIN:-}"
   [[ -n "$NODE_PORT_EXPLICIT" || -z "${SAVED_NODE_PORT:-}" ]] || NODE_PORT="$SAVED_NODE_PORT"
   [[ -n "$ENABLE_XHTTP_EXPLICIT" || -z "${SAVED_ENABLE_XHTTP:-}" ]] || ENABLE_XHTTP="$SAVED_ENABLE_XHTTP"
+  [[ -n "$ENABLE_MASKED_BBR_EXPLICIT" || -z "${SAVED_ENABLE_MASKED_BBR:-}" ]] || ENABLE_MASKED_BBR="$SAVED_ENABLE_MASKED_BBR"
   [[ -n "$XHTTP_PATH_EXPLICIT" || -z "${SAVED_XHTTP_PATH:-}" ]] || XHTTP_PATH="$SAVED_XHTTP_PATH"
   [[ -n "$XHTTP_SOCKET_EXPLICIT" || -z "${SAVED_XHTTP_SOCKET:-}" ]] || XHTTP_SOCKET="$SAVED_XHTTP_SOCKET"
   [[ -n "$MANAGE_FIREWALL_EXPLICIT" || -z "${SAVED_MANAGE_FIREWALL:-}" ]] || MANAGE_FIREWALL="$SAVED_MANAGE_FIREWALL"
@@ -1179,6 +1221,9 @@ load_saved_state() {
 detect_legacy_xhttp() {
   local site="/etc/nginx/sites-available/remnanode-xhttp.conf"
   local detected=""
+  if [[ -n "$ENABLE_XHTTP_EXPLICIT" ]] && ! bool_true "$ENABLE_XHTTP"; then
+    return 0
+  fi
   [[ -n "$XHTTP_DOMAIN_INPUT" || ! -r "$site" ]] && return 0
   detected="$(awk '$1 == "server_name" {gsub(/;/, "", $2); print $2; exit}' "$site" 2>/dev/null || true)"
   if validate_domain "$detected" 2>/dev/null; then
@@ -1307,6 +1352,7 @@ for key, name in files.items():
 }
 
 collect_inputs() {
+  local required_port=""
   load_saved_state
   detect_legacy_xhttp
   validate_existing_compose_overrides
@@ -1321,6 +1367,49 @@ collect_inputs() {
     PANEL_IPS="$(normalize_panel_ips "$PROMPT_VALUE")"
   fi
   validate_panel_ips_basic
+
+  if [[ "$ENABLE_MASKED_BBR" == "auto" ]]; then
+    if [[ -n "$MASKED_BBR_DOMAIN_INPUT" ]]; then
+      ENABLE_MASKED_BBR=1
+    elif bool_true "$YES"; then
+      ENABLE_MASKED_BBR=0
+    else
+      ask_bool 'Настроить рабочий masked BBR (Hysteria 2 + TLS/H3 + Salamander без GECKO)? [y/д/N/н]'
+      ENABLE_MASKED_BBR="$PROMPT_VALUE"
+    fi
+  fi
+
+  if bool_true "$ENABLE_MASKED_BBR"; then
+    EXPECT_HYSTERIA=1
+    [[ -n "$ENABLE_QUIC_TUNING_EXPLICIT" ]] || ENABLE_QUIC_TUNING=0
+    if [[ -n "$XHTTP_DOMAIN_INPUT" && "$ENABLE_XHTTP" == auto ]]; then
+      die "Одновременно заданы MASKED_BBR_DOMAIN и XHTTP_DOMAIN; выберите один transport."
+    fi
+    if [[ "$ENABLE_XHTTP" == "auto" ]]; then
+      ENABLE_XHTTP=0
+    fi
+    MASKED_BBR_DOMAIN="$(normalize_domain "$MASKED_BBR_DOMAIN_INPUT")"
+    if [[ -z "$MASKED_BBR_DOMAIN" ]]; then
+      bool_true "$YES" && die "Для masked BBR нужен MASKED_BBR_DOMAIN."
+      while [[ -z "$MASKED_BBR_DOMAIN" ]]; do
+        ask 'Домен masked BBR: '
+        MASKED_BBR_DOMAIN="$(normalize_domain "$PROMPT_VALUE")"
+        [[ -n "$MASKED_BBR_DOMAIN" ]] || warn "Введите только домен без https:// и пути."
+      done
+    fi
+    validate_domain "$MASKED_BBR_DOMAIN" || die "Некорректный MASKED_BBR_DOMAIN: $MASKED_BBR_DOMAIN"
+    # Certificate/ordinary HTTPS cover helpers use this internal edge-domain.
+    # SAVED_XHTTP_DOMAIN remains empty, so an upgrade cannot enable xHTTP by accident.
+    XHTTP_DOMAIN="$MASKED_BBR_DOMAIN"
+    for required_port in 80 443; do
+      if ! port_in_csv "$required_port" "$PUBLIC_TCP_PORTS"; then
+        [[ -n "$PUBLIC_TCP_PORTS" ]] && PUBLIC_TCP_PORTS="$required_port,$PUBLIC_TCP_PORTS" || PUBLIC_TCP_PORTS="$required_port"
+      fi
+    done
+    if ! port_in_csv 443 "$PUBLIC_UDP_PORTS"; then
+      [[ -n "$PUBLIC_UDP_PORTS" ]] && PUBLIC_UDP_PORTS="443,$PUBLIC_UDP_PORTS" || PUBLIC_UDP_PORTS=443
+    fi
+  fi
 
   if [[ "$ENABLE_XHTTP" == "auto" ]]; then
     if [[ -n "$XHTTP_DOMAIN_INPUT" ]]; then
@@ -1358,11 +1447,11 @@ collect_inputs() {
         PUBLIC_TCP_PORTS="443"
       fi
     fi
-  else
+  elif ! bool_true "$ENABLE_MASKED_BBR"; then
     XHTTP_DOMAIN=""
   fi
 
-  if bool_true "$EXPECT_HYSTERIA" && ! bool_true "$ENABLE_XHTTP"; then
+  if bool_true "$EXPECT_HYSTERIA" && ! bool_true "$ENABLE_XHTTP" && ! bool_true "$ENABLE_MASKED_BBR"; then
     if [[ -n "$TLS_CERT_FILE" || -n "$TLS_KEY_FILE" ]]; then
       [[ -n "$TLS_CERT_FILE" && -n "$TLS_KEY_FILE" ]] || \
         die "Для Hysteria нужно задать и TLS_CERT_FILE, и TLS_KEY_FILE."
@@ -1540,6 +1629,11 @@ print_plan() {
   printf '  safe maintenance: %s (keep %s backups)\n' "$ENABLE_MAINTENANCE" "$BACKUP_RETENTION"
   printf '  native plugins:   %s\n' "$REQUIRE_NODE_PLUGINS"
   printf '  Hysteria check:   %s, udp/%s\n' "$EXPECT_HYSTERIA" "$HYSTERIA_PORT"
+  if bool_true "$ENABLE_MASKED_BBR"; then
+    printf '  masked BBR:       Hysteria 2 + TLS/h3 + BBR + Salamander (no GECKO)\n'
+    printf '  masked domain:    %s\n' "$MASKED_BBR_DOMAIN"
+    printf '  mobile profile:   disablePathMTUDiscovery=true; normal offload/qdisc preserved\n'
+  fi
   if bool_true "$ENABLE_XHTTP"; then
     printf '  xHTTP domain:     %s\n' "$XHTTP_DOMAIN"
     printf '  xHTTP path:       %s\n' "$XHTTP_PATH"
@@ -1755,6 +1849,7 @@ backup_system_paths() {
     "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" \
     "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" "$TLS_DIR" "$PANEL_IPS_FILE" \
     "$COVER_ROOT/index.html" "$COVER_ROOT/404.html" "$HYSTERIA_MASQUERADE_FILE" \
+    "$MASKED_BBR_CONTRACT_FILE" "$MASKED_BBR_PASSWORD_FILE" \
     /etc/nginx/conf.d/00-remnanode-hash-tuning.conf \
     /etc/fstab /etc/nginx/nginx.conf /etc/ufw/user.rules /etc/ufw/user6.rules; do
     [[ -e "$path" || -L "$path" ]] || continue
@@ -1971,7 +2066,8 @@ remove_known_current_files_for_rollback() {
     "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" \
     "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" \
     "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" /etc/nginx/conf.d/00-remnanode-hash-tuning.conf \
-    "$COVER_ROOT/index.html" "$COVER_ROOT/404.html" "$HYSTERIA_MASQUERADE_FILE"
+    "$COVER_ROOT/index.html" "$COVER_ROOT/404.html" "$HYSTERIA_MASQUERADE_FILE" \
+    "$MASKED_BBR_CONTRACT_FILE" "$MASKED_BBR_PASSWORD_FILE"
   while IFS= read -r path; do
     rm -f -- "$path"
   done < <(legacy_paths)
@@ -4500,6 +4596,98 @@ atomic(export, json.dumps(masquerade, ensure_ascii=False, indent=2) + '\n', 0o60
 PY
 }
 
+write_masked_bbr_contract() {
+  local password=""
+  local tmp_password=""
+  bool_true "$ENABLE_MASKED_BBR" || return 0
+  [[ ! -L "$MASKED_BBR_PASSWORD_FILE" && ! -L "$MASKED_BBR_CONTRACT_FILE" ]] || \
+    die "Masked-BBR contract/password не должны быть symlink."
+  install -d -m 0700 "$STATE_DIR"
+
+  if [[ -r "$MASKED_BBR_PASSWORD_FILE" ]]; then
+    require_trusted_root_file "$MASKED_BBR_PASSWORD_FILE"
+    password="$(tr -d '\r\n' <"$MASKED_BBR_PASSWORD_FILE")"
+    [[ "$password" =~ ^[A-Za-z0-9_-]{43,128}$ ]] || \
+      die "Сохранённый Salamander password повреждён; автоматически заменять его опасно."
+  else
+    password="$(openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\r\n')"
+    [[ "$password" =~ ^[A-Za-z0-9_-]{43,128}$ ]] || die "Не удалось создать Salamander password."
+    tmp_password="$(mktemp "$STATE_DIR/.masked-bbr-password.XXXXXX")"
+    printf '%s\n' "$password" >"$tmp_password"
+    chmod 0600 "$tmp_password"
+    mv -f "$tmp_password" "$MASKED_BBR_PASSWORD_FILE"
+  fi
+
+  python3 - "$MASKED_BBR_DOMAIN" "$HYSTERIA_MASQUERADE_FILE" \
+    "$MASKED_BBR_PASSWORD_FILE" "$MASKED_BBR_CONTRACT_FILE" <<'PY'
+import json, os, tempfile
+from pathlib import Path
+import sys
+
+domain = sys.argv[1]
+masquerade_path = Path(sys.argv[2])
+password_path = Path(sys.argv[3])
+output_path = Path(sys.argv[4])
+masquerade = json.loads(masquerade_path.read_text(encoding='utf-8'))
+password = password_path.read_text(encoding='utf-8').strip()
+
+contract = {
+    'schema': 'tokervpn-remnawave-masked-bbr/v1',
+    'purpose': 'Merge only streamSettings into one existing Remnawave Hysteria inbound; preserve inbound id, tag, listen, port, users, routing, squads and all unrelated profiles.',
+    'domain': domain,
+    'transport': 'Hysteria 2 over UDP/443 with TLS ALPN h3, BBR and plain Salamander',
+    'forbidden': ['finalmask.udp[].settings.packetSize', 'GECKO fragmentation', 'host-wide offload disabling'],
+    'streamSettings': {
+        'network': 'hysteria',
+        'security': 'tls',
+        'tlsSettings': {
+            'alpn': ['h3'],
+            'certificates': [{
+                'certificateFile': '/etc/remnanode/tls/fullchain.pem',
+                'keyFile': '/etc/remnanode/tls/privkey.pem'
+            }]
+        },
+        'hysteriaSettings': {
+            'version': 2,
+            'masquerade': masquerade
+        },
+        'finalmask': {
+            'quicParams': {
+                'congestion': 'bbr',
+                'disablePathMTUDiscovery': True
+            },
+            'udp': [{
+                'type': 'salamander',
+                'settings': {'password': password}
+            }]
+        }
+    },
+    'hostDefaults': {
+        'address': domain,
+        'port': 443,
+        'securityLayer': 'TLS',
+        'alpn': 'h3',
+        'fingerprint': 'firefox'
+    }
+}
+
+fd, name = tempfile.mkstemp(prefix='.masked-bbr-contract.', dir=output_path.parent)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+        json.dump(contract, handle, ensure_ascii=False, indent=2)
+        handle.write('\n')
+        handle.flush()
+        os.fchmod(handle.fileno(), 0o600)
+        os.fsync(handle.fileno())
+    os.replace(name, output_path)
+finally:
+    if os.path.exists(name):
+        os.unlink(name)
+PY
+  chmod 0600 "$MASKED_BBR_CONTRACT_FILE" "$MASKED_BBR_PASSWORD_FILE"
+  log "Masked-BBR contract создан: $MASKED_BBR_CONTRACT_FILE (root only)."
+}
+
 render_nginx_xhttp_site() {
   local ipv6_http=""
   local enable_ipv6=0
@@ -4587,6 +4775,69 @@ $grpc_socket_keepalive
 EOF
 }
 
+render_nginx_masked_bbr_site() {
+  local ipv6_http=""
+  local enable_ipv6=0
+  local https_listeners=""
+  local nginx_version=""
+  if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] && \
+     [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" == 0 ]]; then
+    ipv6_http="    listen [::]:80;"
+    enable_ipv6=1
+  fi
+  nginx_version="$(nginx -v 2>&1 | sed -n 's#^nginx version: nginx/##p' | awk '{print $1}')"
+  https_listeners="$(nginx_https_listeners "$nginx_version" "$enable_ipv6")"
+  cat <<EOF
+# remnanode-installer-managed-masked-bbr-cover
+server {
+    listen 80;
+$ipv6_http
+    server_name $MASKED_BBR_DOMAIN;
+    server_tokens off;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root $NGINX_ACME_ROOT;
+        default_type text/plain;
+        auth_basic off;
+        allow all;
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 301 https://$MASKED_BBR_DOMAIN\$request_uri;
+    }
+}
+
+server {
+$https_listeners
+    server_name $MASKED_BBR_DOMAIN;
+    server_tokens off;
+    access_log off;
+    add_header Strict-Transport-Security "max-age=604800" always;
+    add_header X-Content-Type-Options nosniff always;
+
+    ssl_certificate $TLS_DIR/fullchain.pem;
+    ssl_certificate_key $TLS_DIR/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:REMNANODE_TLS:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+    keepalive_timeout 75s;
+    keepalive_requests 1000;
+    reset_timedout_connection on;
+
+    root $COVER_ROOT;
+    index index.html;
+    charset utf-8;
+    autoindex off;
+    disable_symlinks on;
+    error_page 404 /404.html;
+    location = /404.html { internal; }
+    location / { try_files \$uri \$uri/ =404; }
+}
+EOF
+}
+
 verify_local_cover() {
   local check_dir="" cycle="" version="" status=""
   check_dir="$(mktemp -d /tmp/remnanode-cover-check.XXXXXX)"
@@ -4660,6 +4911,38 @@ write_nginx_xhttp_site() {
   (( changed == 0 )) || log "xHTTP Nginx site обновлён."
 }
 
+write_nginx_masked_bbr_site() {
+  local tmp_site="" changed=0 had_bootstrap=0 loaded_dump=""
+  write_cover_assets
+  tmp_site="$(mktemp)"
+  render_nginx_masked_bbr_site >"$tmp_site"
+  if [[ ! -r "$NGINX_SITE_AVAILABLE" ]] || ! cmp -s "$tmp_site" "$NGINX_SITE_AVAILABLE"; then
+    install -m 0644 "$tmp_site" "$NGINX_SITE_AVAILABLE"
+    changed=1
+  fi
+  rm -f "$tmp_site"
+  ln -sfn "$NGINX_SITE_AVAILABLE" "$NGINX_SITE_ENABLED"
+  if [[ -e "$NGINX_SITES_ENABLED_BOOTSTRAP" || -e "$NGINX_CONF_D_BOOTSTRAP" || \
+        -e "$NGINX_BOOTSTRAP_AVAILABLE" ]]; then
+    had_bootstrap=1
+  fi
+  rm -f "$NGINX_SITES_ENABLED_BOOTSTRAP" "$NGINX_CONF_D_BOOTSTRAP" "$NGINX_BOOTSTRAP_AVAILABLE"
+  nginx -t
+  loaded_dump="$(nginx -T 2>&1)"
+  grep -Fq '# remnanode-installer-managed-masked-bbr-cover' <<<"$loaded_dump" || \
+    die "Nginx принял файл, но не загрузил managed masked-BBR cover."
+  systemctl enable nginx >/dev/null
+  if ! systemctl is-active --quiet nginx.service; then
+    systemctl start nginx
+  elif (( NGINX_RESTART_REQUIRED == 1 )); then
+    systemctl restart nginx
+  elif (( changed == 1 || had_bootstrap == 1 || TLS_CHANGED == 1 )); then
+    systemctl reload nginx
+  fi
+  verify_local_cover
+  (( changed == 0 )) || log "Masked-BBR HTTPS cover обновлён."
+}
+
 disable_xhttp_module() {
   command -v nginx >/dev/null 2>&1 && acquire_nginx_lock
   rm -f "$NGINX_SITES_ENABLED_SITE" "$NGINX_CONF_D_SITE" "$NGINX_SITE_AVAILABLE" "$CERT_DEPLOY_HOOK" \
@@ -4683,7 +4966,7 @@ configure_xhttp_module() {
   local need_bootstrap=0
   local existing_le=""
   check_hysteria_port_conflicts
-  if ! bool_true "$ENABLE_XHTTP"; then
+  if ! bool_true "$ENABLE_XHTTP" && ! bool_true "$ENABLE_MASKED_BBR"; then
     disable_xhttp_module
     if [[ -n "$TLS_CERT_FILE" || -n "$TLS_KEY_FILE" ]]; then
       [[ -n "$TLS_CERT_FILE" && -n "$TLS_KEY_FILE" ]] || die "Нужно задать и TLS_CERT_FILE, и TLS_KEY_FILE."
@@ -4698,7 +4981,11 @@ configure_xhttp_module() {
     return 0
   fi
 
-  log "Настраиваю optional xHTTP module без HTTP/3 и без подмен RemnaNode"
+  if bool_true "$ENABLE_MASKED_BBR"; then
+    log "Настраиваю TLS и обычное HTTPS-прикрытие для masked BBR; UDP/443 остаётся у Hysteria"
+  else
+    log "Настраиваю optional xHTTP module без HTTP/3 и без подмен RemnaNode"
+  fi
   check_xhttp_port_conflicts
   ensure_nginx_hash_tuning
   apt_retry install -y --no-install-recommends nginx certbot
@@ -4730,7 +5017,11 @@ configure_xhttp_module() {
   else
     rm -f "$CERT_DEPLOY_HOOK"
   fi
-  write_nginx_xhttp_site
+  if bool_true "$ENABLE_MASKED_BBR"; then
+    write_nginx_masked_bbr_site
+  else
+    write_nginx_xhttp_site
+  fi
   verify_acme_http_path
   release_nginx_lock
 }
@@ -5634,8 +5925,22 @@ try:
             configured = (kind == 'string' and bool(masq.get('content')) and masq.get('statusCode', 200) == 200) or \
                          (kind == 'file' and bool(masq.get('dir'))) or \
                          (kind == 'proxy' and bool(masq.get('url')) and not masq.get('insecure', False))
-            result.append({'bbr': stream.get('finalmask', {}).get('quicParams', {}).get('congestion') == 'bbr',
-                           'masquerade_configured': bool(configured)})
+            finalmask = stream.get('finalmask', {}) or {}
+            quic = finalmask.get('quicParams', {}) or {}
+            udp = finalmask.get('udp', []) or []
+            salamander = [item for item in udp if isinstance(item, dict) and item.get('type') == 'salamander']
+            plain_salamander = len(udp) == 1 and len(salamander) == 1 and \
+                bool((salamander[0].get('settings', {}) or {}).get('password'))
+            no_gecko = all('packetSize' not in (item.get('settings', {}) or {}) for item in salamander)
+            tls = stream.get('tlsSettings', {}) or {}
+            result.append({
+                'bbr': quic.get('congestion') == 'bbr',
+                'pmtud_disabled': quic.get('disablePathMTUDiscovery') is True,
+                'plain_salamander': plain_salamander,
+                'no_gecko': no_gecko,
+                'tls_h3': stream.get('security') == 'tls' and 'h3' in (tls.get('alpn', []) or []),
+                'masquerade_configured': bool(configured)
+            })
         print(json.dumps(result))
 except Exception:
     # No exceptions containing private URL, accounts or certificate material.
@@ -5649,24 +5954,46 @@ verify_hysteria_cover_contract() {
   if ! summary="$(read_live_profile_for_cover_check 2>/dev/null)"; then
     HYSTERIA_COVER_STATUS=unknown
     warn "HTTP/3-прикрытие: runtime-профиль прочитать не удалось; защита НЕ подтверждена."
+    if bool_true "$ENABLE_MASKED_BBR" && bool_true "$REQUIRE_PROFILE_READY"; then
+      die "Не удалось прочитать runtime-профиль для строгой masked-BBR проверки."
+    fi
     return 0
   fi
-  state="$(printf '%s' "$summary" | python3 -c '
+  state="$(python3 - "$ENABLE_MASKED_BBR" "$summary" <<'PY'
 import json, sys
-items = json.load(sys.stdin)
-print("not-used" if not items else "configured" if all(x["bbr"] and x["masquerade_configured"] for x in items) else "pending-panel")
-')"
+items = json.loads(sys.argv[2])
+masked = sys.argv[1].lower() in ('1', 'true', 'yes', 'y', 'on')
+basic = lambda x: x['bbr'] and x['masquerade_configured']
+exact = lambda x: basic(x) and x['pmtud_disabled'] and x['plain_salamander'] and x['no_gecko'] and x['tls_h3']
+print('not-used' if not items else 'configured' if all((exact if masked else basic)(x) for x in items) else 'pending-panel')
+PY
+)"
   HYSTERIA_COVER_STATUS="$state"
   case "$state" in
     configured)
-      log "Hysteria: BBR и masquerade есть в runtime-профиле; внешний HTTP/3/VPN тест всё равно нужен."
+      if bool_true "$ENABLE_MASKED_BBR"; then
+        log "Masked BBR подтверждён в runtime: TLS/h3, BBR, PMTUD off, plain Salamander, masquerade, без GECKO."
+      else
+        log "Hysteria: BBR и masquerade есть в runtime-профиле; внешний HTTP/3/VPN тест всё равно нужен."
+      fi
       ;;
     not-used)
       log "В активном профиле нет Hysteria; HTTP/3-прикрытие Hysteria не требуется."
+      if bool_true "$ENABLE_MASKED_BBR" && bool_true "$REQUIRE_PROFILE_READY"; then
+        die "Masked BBR включён, но в runtime-профиле нет Hysteria inbound."
+      fi
       ;;
     *)
-      warn "Hysteria: BBR/masquerade в профиле НЕ подтверждены. Нода не меняет профиль мастер-панели автоматически."
-      warn "Готовый объект masquerade: $HYSTERIA_MASQUERADE_FILE — добавьте только в streamSettings.hysteriaSettings.masquerade нужных inbound-профилей."
+      if bool_true "$ENABLE_MASKED_BBR"; then
+        warn "Masked BBR НЕ подтверждён в профиле панели: нужен точный contract $MASKED_BBR_CONTRACT_FILE."
+        warn "Не добавляйте packetSize: он включает GECKO, который не прошёл LTE-проверку рабочей схемы."
+        if bool_true "$REQUIRE_PROFILE_READY"; then
+          die "Runtime-профиль не соответствует masked-BBR contract; установка не считается готовой."
+        fi
+      else
+        warn "Hysteria: BBR/masquerade в профиле НЕ подтверждены. Нода не меняет профиль мастер-панели автоматически."
+        warn "Готовый объект masquerade: $HYSTERIA_MASQUERADE_FILE — добавьте только в streamSettings.hysteriaSettings.masquerade нужных inbound-профилей."
+      fi
       ;;
   esac
 }
@@ -5759,7 +6086,13 @@ write_state() {
     printf 'SAVED_NODE_PORT=%q\n' "$NODE_PORT"
     printf 'SAVED_PANEL_IPS=%q\n' "$PANEL_IPS"
     printf 'SAVED_ENABLE_XHTTP=%q\n' "$ENABLE_XHTTP"
-    printf 'SAVED_XHTTP_DOMAIN=%q\n' "$XHTTP_DOMAIN"
+    if bool_true "$ENABLE_XHTTP"; then
+      printf 'SAVED_XHTTP_DOMAIN=%q\n' "$XHTTP_DOMAIN"
+    else
+      printf 'SAVED_XHTTP_DOMAIN=%q\n' ""
+    fi
+    printf 'SAVED_ENABLE_MASKED_BBR=%q\n' "$ENABLE_MASKED_BBR"
+    printf 'SAVED_MASKED_BBR_DOMAIN=%q\n' "$MASKED_BBR_DOMAIN"
     printf 'SAVED_XHTTP_PATH=%q\n' "$XHTTP_PATH"
     printf 'SAVED_XHTTP_SOCKET=%q\n' "$XHTTP_SOCKET"
     printf 'SAVED_MANAGE_FIREWALL=%q\n' "$MANAGE_FIREWALL"
@@ -5843,6 +6176,11 @@ legacy_reboot_required() {
 
 print_profile_contract() {
   printf '\nПрофиль мастер-панели должен совпадать с runtime-контрактом:\n'
+  if bool_true "$ENABLE_MASKED_BBR"; then
+    printf '  MASKED-BBR-443: Hysteria 2/UDP/%s, TLS/h3, Firefox, BBR, PMTUD off\n' "$HYSTERIA_PORT"
+    printf '  Masking:        plain Salamander; packetSize/GECKO запрещён для проверенной LTE-схемы\n'
+    printf '  Merge contract: %s (root only; содержит Salamander password)\n' "$MASKED_BBR_CONTRACT_FILE"
+  fi
   if bool_true "$ENABLE_XHTTP"; then
     printf '  STABLE-IN-443: VLESS/xHTTP, listen=%s,0666, path=%s\n' "$XHTTP_SOCKET" "$XHTTP_PATH"
     printf '  xHTTP edge:    TCP/443 TLS + HTTP/2 через Nginx; HTTP/3 на Nginx отключён\n'
@@ -5953,6 +6291,9 @@ PY
   if [[ -r "$TLS_DIR/fullchain.pem" ]]; then
     printf 'TLS expires:     %s\n' "$(openssl x509 -in "$TLS_DIR/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2-)"
   fi
+  if [[ -r "$MASKED_BBR_CONTRACT_FILE" ]]; then
+    printf 'Masked contract: %s\n' "$MASKED_BBR_CONTRACT_FILE"
+  fi
 }
 
 select_rollback_backup() {
@@ -6025,6 +6366,7 @@ run_install() {
   # The monitoring panel never logs into nodes to transfer the IP list.
   install_ssh_peers_pull_module
   write_cover_assets
+  write_masked_bbr_contract
   configure_xhttp_module
   install_rendered_files
   configure_xhttp_socket_guard
