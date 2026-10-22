@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Safely merge a node-generated masked-BBR contract into one panel profile.
+
+This tool never talks to the panel and never changes the input file. It creates
+a complete candidate JSON that can be reviewed/imported by the operator.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+from pathlib import Path
+import tempfile
+from typing import Any
+
+
+def read_object(path: Path) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"expected a regular file: {path}")
+    if path.stat().st_size > 16 * 1024 * 1024:
+        raise SystemExit(f"file is too large: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"cannot read JSON {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SystemExit(f"top-level JSON must be an object: {path}")
+    return value
+
+
+def find_inbounds(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    root = profile.get("config", profile)
+    if not isinstance(root, dict) or not isinstance(root.get("inbounds"), list):
+        raise SystemExit("profile must contain config.inbounds[] or inbounds[]")
+    result = root["inbounds"]
+    if not all(isinstance(item, dict) for item in result):
+        raise SystemExit("every inbound must be an object")
+    return result
+
+
+def validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    if contract.get("schema") != "tokervpn-remnawave-masked-bbr/v1":
+        raise SystemExit("unsupported masked-BBR contract schema")
+    stream = contract.get("streamSettings")
+    if not isinstance(stream, dict):
+        raise SystemExit("contract has no streamSettings object")
+    finalmask = stream.get("finalmask")
+    udp = finalmask.get("udp") if isinstance(finalmask, dict) else None
+    quic = finalmask.get("quicParams") if isinstance(finalmask, dict) else None
+    tls = stream.get("tlsSettings")
+    if stream.get("network") != "hysteria" or stream.get("security") != "tls":
+        raise SystemExit("contract must use Hysteria over TLS")
+    if not isinstance(tls, dict) or "h3" not in (tls.get("alpn") or []):
+        raise SystemExit("contract must require TLS ALPN h3")
+    if not isinstance(quic, dict) or quic.get("congestion") != "bbr" or \
+            quic.get("disablePathMTUDiscovery") is not True:
+        raise SystemExit("contract must require BBR and disablePathMTUDiscovery=true")
+    if not isinstance(udp, list) or len(udp) != 1 or not isinstance(udp[0], dict):
+        raise SystemExit("contract must contain exactly one UDP mask")
+    settings = udp[0].get("settings")
+    if udp[0].get("type") != "salamander" or not isinstance(settings, dict) or \
+            not settings.get("password"):
+        raise SystemExit("contract must contain a non-empty Salamander password")
+    if "packetSize" in settings:
+        raise SystemExit("packetSize enables GECKO and is forbidden by the working contract")
+    return stream
+
+
+def candidate(profile: dict[str, Any], contract: dict[str, Any], tag: str) -> dict[str, Any]:
+    result = copy.deepcopy(profile)
+    stream = validate_contract(contract)
+    matches = [item for item in find_inbounds(result) if item.get("tag") == tag]
+    if len(matches) != 1:
+        raise SystemExit(f"expected exactly one inbound with tag {tag!r}, found {len(matches)}")
+    inbound = matches[0]
+    if inbound.get("protocol") != "hysteria":
+        raise SystemExit("target inbound is not Hysteria")
+    settings = inbound.get("settings")
+    if not isinstance(settings, dict) or settings.get("version") not in (2, "2"):
+        raise SystemExit("target inbound settings.version must be 2")
+    port = inbound.get("port")
+    if port not in (443, "443"):
+        raise SystemExit(f"working masked-BBR contract requires inbound port 443, found {port!r}")
+    inbound["streamSettings"] = copy.deepcopy(stream)
+    return result
+
+
+def write_atomic(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o600)
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Create a full Remnawave profile candidate with the exact working masked-BBR transport"
+    )
+    parser.add_argument("--profile", required=True, type=Path, help="exported source profile JSON")
+    parser.add_argument("--contract", required=True, type=Path, help="node-generated masked-bbr-contract.json")
+    parser.add_argument("--inbound-tag", required=True, help="exact Hysteria inbound tag to update")
+    parser.add_argument("--output", required=True, type=Path, help="new candidate JSON; input is never overwritten")
+    args = parser.parse_args()
+
+    profile = read_object(args.profile)
+    contract = read_object(args.contract)
+    output = args.output.resolve()
+    if output == args.profile.resolve() or output == args.contract.resolve():
+        raise SystemExit("output must be a new file; overwriting source or contract is forbidden")
+    write_atomic(output, candidate(profile, contract, args.inbound_tag))
+    print(f"candidate written: {output}")
+    print("preserved: inbound id/tag/listen/port/settings, users, routing, squads and unrelated profiles")
+    print("changed: target inbound streamSettings only")
+
+
+if __name__ == "__main__":
+    main()
