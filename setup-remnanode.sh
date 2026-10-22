@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.1.4"
+INSTALLER_VERSION="4.1.5"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -5609,9 +5609,20 @@ prepare_hysteria_revocation_guard() {
       --cpus "$build_cpu" --memory "${build_memory}m" --memory-swap "${build_memory_swap}m" \
       -e CGO_ENABLED=0 -e GOTOOLCHAIN=local -e GOENV=off -e GOMAXPROCS="$build_cpu" \
       -e GOMEMLIMIT="$((build_memory - 128))MiB" \
-      -e GOPROXY=https://proxy.golang.org,direct -e GOSUMDB=sum.golang.org \
+      -e 'GOPROXY=https://proxy.golang.org|direct' -e GOSUMDB=off -e GOFLAGS=-mod=readonly \
       -v "$CORE_FIX_BUILD_DIR/source:/src:rw" -v "$CORE_FIX_BUILD_DIR/image:/out:rw" -w /src \
       "$CORE_FIX_BUILDER" sh -ec '
+        downloaded=0
+        attempt=1
+        while [ "$attempt" -le 3 ]; do
+          if go mod download; then
+            downloaded=1
+            break
+          fi
+          sleep $((attempt * 5))
+          attempt=$((attempt + 1))
+        done
+        [ "$downloaded" -eq 1 ]
         go test -p 1 -count=3 ./common/protocol ./proxy/hysteria/account
         go build -p 1 -trimpath -buildvcs=false -ldflags "-s -w -X github.com/xtls/xray-core/core.build=tokervpn-hy-revoke-v1-5ca6f4b" -o /out/xray ./main
       ' >"$CORE_FIX_BUILD_DIR/build.log" 2>&1 || {

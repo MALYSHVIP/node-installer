@@ -35,6 +35,10 @@ run_install = source.split("run_install() {", 1)[1].split("\n}", 1)[0]
 assert run_install.count("configure_small_swap") == 1
 assert run_install.index("configure_small_swap") < run_install.index("prepare_hysteria_revocation_guard")
 assert '--memory-swap "${build_memory_swap}m"' in source
+assert "GOPROXY=https://proxy.golang.org|direct" in source
+assert "GOSUMDB=off" in source
+assert "GOFLAGS=-mod=readonly" in source
+assert 'while [ "$attempt" -le 3 ]' in source
 PY
 
 test_root="$(mktemp -d /tmp/remnanode-masked-bbr-test.XXXXXX)"
