@@ -5541,7 +5541,7 @@ PY
 
 prepare_hysteria_revocation_guard() {
   local arch="" image_arch="" stock_version="" rc=0 cached="" key="" cache_label=""
-  local build_memory=0 build_cpu=1 available_mb=0 free_mb=0 binary_sha=""
+  local build_memory=0 build_memory_swap=0 build_cpu=1 available_mb=0 swap_free_mb=0 memory_budget_mb=0 free_mb=0 binary_sha=""
   local original_image="$SELECTED_IMAGE" original_id="$SELECTED_IMAGE_ID"
   arch="$(core_fix_architecture)"
   image_arch="$(docker image inspect --format '{{.Architecture}}' "$original_id")"
@@ -5579,14 +5579,23 @@ prepare_hysteria_revocation_guard() {
     binary_sha="$(docker image inspect --format '{{index .Config.Labels "io.tokervpn.revocation.sha256"}}' "$cached")"
   else
     available_mb="$(awk '/MemAvailable:/ {print int($2/1024)}' /proc/meminfo)"
-    [[ "$available_mb" =~ ^[0-9]+$ ]] || die "Не удалось определить доступную память для сборки."
-    (( available_mb >= 768 )) || die "Для первой сборки исправления нужны минимум 768 MiB свободной RAM; работающая нода сохранена."
+    swap_free_mb="$(awk '/SwapFree:/ {print int($2/1024)}' /proc/meminfo)"
+    [[ "$available_mb" =~ ^[0-9]+$ && "$swap_free_mb" =~ ^[0-9]+$ ]] || \
+      die "Не удалось определить доступную RAM/swap для сборки."
+    memory_budget_mb=$((available_mb + swap_free_mb))
+    (( memory_budget_mb >= 768 )) || \
+      die "Для первой сборки исправления нужны минимум 768 MiB доступной RAM+swap; сейчас ${memory_budget_mb}MiB."
     build_memory=$((available_mb / 2));(( build_memory >= 512 )) || build_memory=512
     (( build_memory <= 1536 )) || build_memory=1536
+    build_memory_swap="$build_memory"
+    if (( swap_free_mb > 0 )); then
+      build_memory_swap=$((build_memory + swap_free_mb))
+      (( build_memory_swap <= 1536 )) || build_memory_swap=1536
+    fi
     build_cpu="$(nproc)";(( build_cpu <= 2 )) || build_cpu=2
     free_mb="$(df -Pm "$CORE_FIX_BUILD_DIR" | awk 'NR==2 {print $4}')"
     [[ "$free_mb" =~ ^[0-9]+$ ]] && (( free_mb >= 3500 )) || die "Для первой сборки нужны 3.5 GiB свободного места."
-    log "Собираю исправленное ядро для $arch: до $build_cpu CPU, ${build_memory}MiB RAM."
+    log "Собираю исправленное ядро для $arch: до $build_cpu CPU, ${build_memory}MiB RAM, лимит RAM+swap ${build_memory_swap}MiB."
     curl --proto '=https' --tlsv1.2 -fL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 180 \
       "https://codeload.github.com/XTLS/Xray-core/tar.gz/$CORE_FIX_COMMIT" -o "$CORE_FIX_BUILD_DIR/source.tgz"
     printf '%s  %s\n' "$CORE_FIX_SOURCE_SHA256" "$CORE_FIX_BUILD_DIR/source.tgz" | sha256sum -c - >/dev/null
@@ -5597,7 +5606,7 @@ prepare_hysteria_revocation_guard() {
     timeout --kill-after=20s 1800s docker run --rm \
       --cidfile "$CORE_FIX_BUILD_DIR/build.cid" --label io.tokervpn.installer-scope=core-revocation-build \
       --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 \
-      --cpus "$build_cpu" --memory "${build_memory}m" --memory-swap "${build_memory}m" \
+      --cpus "$build_cpu" --memory "${build_memory}m" --memory-swap "${build_memory_swap}m" \
       -e CGO_ENABLED=0 -e GOTOOLCHAIN=local -e GOENV=off -e GOMAXPROCS="$build_cpu" \
       -e GOMEMLIMIT="$((build_memory - 128))MiB" \
       -e GOPROXY=https://proxy.golang.org,direct -e GOSUMDB=sum.golang.org \
@@ -6409,6 +6418,9 @@ run_install() {
   create_backup
   install_base_packages
   ensure_docker
+  # The verified Hysteria patch is compiled before node files are rendered.
+  # Low-memory VPSes therefore need their requested swap before this step.
+  configure_small_swap
   validate_panel_ips_strict
   validate_secret_payload
   select_and_pull_image
@@ -6417,7 +6429,6 @@ run_install() {
   stop_legacy_units
   prepare_directories
   cleanup_legacy_files
-  configure_small_swap
   configure_minimal_sysctl
   configure_quic_runtime_tuning
   write_logrotate

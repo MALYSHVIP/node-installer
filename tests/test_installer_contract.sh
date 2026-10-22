@@ -26,6 +26,16 @@ if grep -F 'version | head -n1' "$repo_dir/setup-remnanode.sh" >/dev/null; then
   printf 'unsafe version/head pipeline reintroduced\n' >&2
   exit 1
 fi
+python3 - "$repo_dir/setup-remnanode.sh" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+run_install = source.split("run_install() {", 1)[1].split("\n}", 1)[0]
+assert run_install.count("configure_small_swap") == 1
+assert run_install.index("configure_small_swap") < run_install.index("prepare_hysteria_revocation_guard")
+assert '--memory-swap "${build_memory_swap}m"' in source
+PY
 
 test_root="$(mktemp -d /tmp/remnanode-masked-bbr-test.XXXXXX)"
 trap 'rm -rf -- "$test_root"' EXIT
