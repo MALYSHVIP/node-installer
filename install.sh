@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
-BOOTSTRAP_VERSION="1.2.1"
+BOOTSTRAP_VERSION="1.2.2"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 export INSTALLER_REPO INSTALLER_REF
@@ -61,8 +61,13 @@ run_installer_script() {
     export NODE_INSTALLER_BOOTSTRAP_TMP_FILE="$TMP_FILE"
   fi
 
-  # /dev/tty may exist but be unopenable in a detached/non-interactive shell.
-  if { exec 7</dev/tty; } 2>/dev/null; then
+  # Preserve an already-working stdin. In particular, sudo with use_pty gives
+  # the bootstrap a relay PTY as fd 0. Reopening /dev/tty inside that process
+  # bypasses sudo's input relay on affected hosts: prompts are visible, but the
+  # operator's replies never reach the installer.
+  if [[ -t 0 ]]; then
+    exec "$bash_bin" "$installer" "$@"
+  elif { exec 7</dev/tty; } 2>/dev/null; then
     exec "$bash_bin" "$installer" "$@" <&7 7<&-
   else
     exec "$bash_bin" "$installer" "$@"
