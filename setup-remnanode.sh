@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.1.5"
+INSTALLER_VERSION="4.1.8"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -76,8 +76,8 @@ SSH_PEERS_TOKEN="/etc/remnanode/ssh-peers-token"
 SSH_PEERS_NODE_IP="/etc/remnanode/ssh-peers-node-ip"
 DNS_REFLECTION_GUARD_SCRIPT="/usr/local/sbin/remnanode-dns-reflection-guard.sh"
 DNS_REFLECTION_GUARD_SERVICE="/etc/systemd/system/remnanode-dns-reflection-guard.service"
-BITTORRENT_GUARD_SCRIPT="/usr/local/sbin/remnanode-bittorrent-guard.sh"
-BITTORRENT_GUARD_SERVICE="/etc/systemd/system/remnanode-bittorrent-guard.service"
+BITTORRENT_GUARD_SCRIPT="/usr/local/sbin/vpn-torrent-guard.sh"
+BITTORRENT_GUARD_SERVICE="/etc/systemd/system/vpn-torrent-guard.service"
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/60-remnanode-limits.conf"
 LEGACY_REBOOT_MARKER="$STATE_DIR/legacy-runtime-boot-id"
 
@@ -157,12 +157,12 @@ PUBLIC_UDP_PORTS="${PUBLIC_UDP_PORTS-443}"
 BLOCK_SMTP_EGRESS="${BLOCK_SMTP_EGRESS:-1}"
 BLOCK_SMTP_FORWARD="${BLOCK_SMTP_FORWARD:-1}"
 SMTP_EGRESS_PORTS="${SMTP_EGRESS_PORTS:-25,465,587,2525}"
-# HOST-WIDE policies, not native per-profile Node plugins. Opt in on fresh
-# installations; updates retain the previously saved choices.
-ENABLE_SPAMHAUS_EGRESS_GUARD="${ENABLE_SPAMHAUS_EGRESS_GUARD:-0}"
-ENABLE_OUTBOUND_SSH_GUARD="${ENABLE_OUTBOUND_SSH_GUARD:-0}"
-ENABLE_DNS_REFLECTION_GUARD="${ENABLE_DNS_REFLECTION_GUARD:-0}"
-ENABLE_BITTORRENT_GUARD="${ENABLE_BITTORRENT_GUARD:-0}"
+# HOST-WIDE policies, not native per-profile Node plugins. All guards
+# are on for new installs; updates keep explicitly saved policy choices.
+ENABLE_SPAMHAUS_EGRESS_GUARD="${ENABLE_SPAMHAUS_EGRESS_GUARD:-1}"
+ENABLE_OUTBOUND_SSH_GUARD="${ENABLE_OUTBOUND_SSH_GUARD:-1}"
+ENABLE_DNS_REFLECTION_GUARD="${ENABLE_DNS_REFLECTION_GUARD:-1}"
+ENABLE_BITTORRENT_GUARD="${ENABLE_BITTORRENT_GUARD:-1}"
 ENABLE_BBR="${ENABLE_BBR:-1}"
 ENABLE_QUIC_TUNING="${ENABLE_QUIC_TUNING:-0}"
 AUTO_SWAP="${AUTO_SWAP:-1}"
@@ -461,7 +461,11 @@ ask() {
 }
 
 ask_secret() {
-  ask "SECRET_KEY из карточки ноды (ввод отображается): "
+  while true; do
+    ask "SECRET_KEY из карточки ноды (ввод отображается): "
+    [[ -n "$(trim "$PROMPT_VALUE")" ]] && return 0
+    warn "Получена пустая строка. Вставьте SECRET_KEY и нажмите Enter один раз."
+  done
 }
 
 ask_bool() {
@@ -518,6 +522,7 @@ Options:
   --no-spamhaus-guard       Не ставить Spamhaus DROP egress guard
   --no-outbound-ssh-guard   Не блокировать исходящий/forwarded TCP/22
   --no-dns-reflection-guard Не блокировать публичный DNS egress/forward
+  --bittorrent-guard        Включить BitTorrent guard без изменения SSH/DNS guards
   --no-bittorrent-guard     Не ставить BitTorrent copyright-abuse guard
   --no-antiabuse-guards     Отключить все дополнительные anti-abuse guards
   --no-bbr                  Не применять минимальный BBR sysctl
@@ -710,6 +715,11 @@ parse_args() {
       --no-dns-reflection-guard)
         ENABLE_DNS_REFLECTION_GUARD=0
         ENABLE_DNS_REFLECTION_GUARD_EXPLICIT=1
+        shift
+        ;;
+      --bittorrent-guard)
+        ENABLE_BITTORRENT_GUARD=1
+        ENABLE_BITTORRENT_GUARD_EXPLICIT=1
         shift
         ;;
       --no-bittorrent-guard)
@@ -1258,7 +1268,14 @@ load_saved_state() {
   [[ -n "$ENABLE_SPAMHAUS_EGRESS_GUARD_EXPLICIT" || -z "${SAVED_ENABLE_SPAMHAUS_EGRESS_GUARD:-}" ]] || ENABLE_SPAMHAUS_EGRESS_GUARD="$SAVED_ENABLE_SPAMHAUS_EGRESS_GUARD"
   [[ -n "$ENABLE_OUTBOUND_SSH_GUARD_EXPLICIT" || -z "${SAVED_ENABLE_OUTBOUND_SSH_GUARD:-}" ]] || ENABLE_OUTBOUND_SSH_GUARD="$SAVED_ENABLE_OUTBOUND_SSH_GUARD"
   [[ -n "$ENABLE_DNS_REFLECTION_GUARD_EXPLICIT" || -z "${SAVED_ENABLE_DNS_REFLECTION_GUARD:-}" ]] || ENABLE_DNS_REFLECTION_GUARD="$SAVED_ENABLE_DNS_REFLECTION_GUARD"
-  [[ -n "$ENABLE_BITTORRENT_GUARD_EXPLICIT" || -z "${SAVED_ENABLE_BITTORRENT_GUARD:-}" ]] || ENABLE_BITTORRENT_GUARD="$SAVED_ENABLE_BITTORRENT_GUARD"
+  # Legacy implicit 0 migrates to protection; explicit v2 opt-out is preserved.
+  if [[ -z "$ENABLE_BITTORRENT_GUARD_EXPLICIT" ]]; then
+    if [[ "${SAVED_BITTORRENT_POLICY_V2:-0}" == "1" && -n "${SAVED_ENABLE_BITTORRENT_GUARD:-}" ]]; then
+      ENABLE_BITTORRENT_GUARD="$SAVED_ENABLE_BITTORRENT_GUARD"
+    elif [[ "${SAVED_ENABLE_BITTORRENT_GUARD:-}" == "1" ]]; then
+      ENABLE_BITTORRENT_GUARD=1
+    fi
+  fi
   [[ -n "$ENABLE_BBR_EXPLICIT" || -z "${SAVED_ENABLE_BBR:-}" ]] || ENABLE_BBR="$SAVED_ENABLE_BBR"
   [[ -n "$ENABLE_QUIC_TUNING_EXPLICIT" || -z "${SAVED_ENABLE_QUIC_TUNING:-}" ]] || ENABLE_QUIC_TUNING="$SAVED_ENABLE_QUIC_TUNING"
   [[ -n "$AUTO_SWAP_EXPLICIT" || -z "${SAVED_AUTO_SWAP:-}" ]] || AUTO_SWAP="$SAVED_AUTO_SWAP"
@@ -1444,10 +1461,10 @@ collect_inputs() {
     MASKED_BBR_DOMAIN="$(normalize_domain "$MASKED_BBR_DOMAIN_INPUT")"
     if [[ -z "$MASKED_BBR_DOMAIN" ]]; then
       bool_true "$YES" && die "Для masked BBR нужен MASKED_BBR_DOMAIN."
-      while [[ -z "$MASKED_BBR_DOMAIN" ]]; do
+      while ! validate_domain "$MASKED_BBR_DOMAIN"; do
         ask 'Домен masked BBR: '
         MASKED_BBR_DOMAIN="$(normalize_domain "$PROMPT_VALUE")"
-        [[ -n "$MASKED_BBR_DOMAIN" ]] || warn "Введите только домен без https:// и пути."
+        validate_domain "$MASKED_BBR_DOMAIN" || warn "Введите корректный домен без https:// и пути."
       done
     fi
     validate_domain "$MASKED_BBR_DOMAIN" || die "Некорректный MASKED_BBR_DOMAIN: $MASKED_BBR_DOMAIN"
@@ -1479,10 +1496,10 @@ collect_inputs() {
     XHTTP_DOMAIN="$(normalize_domain "$XHTTP_DOMAIN_INPUT")"
     if [[ -z "$XHTTP_DOMAIN" ]]; then
       bool_true "$YES" && die "Для xHTTP нужен XHTTP_DOMAIN."
-      while [[ -z "$XHTTP_DOMAIN" ]]; do
+      while ! validate_domain "$XHTTP_DOMAIN"; do
         ask 'Домен xHTTP: '
         XHTTP_DOMAIN="$(normalize_domain "$PROMPT_VALUE")"
-        [[ -n "$XHTTP_DOMAIN" ]] || warn "Получена пустая строка. Введите только домен и нажмите Enter один раз."
+        validate_domain "$XHTTP_DOMAIN" || warn "Введите корректный домен и нажмите Enter один раз."
       done
     fi
     validate_xhttp
@@ -1872,7 +1889,10 @@ remnanode-spamhaus-egress-guard.service
 remnanode-outbound-ssh-guard.service
 remnanode-ssh-peers.service
 remnanode-dns-reflection-guard.service
+vpn-torrent-guard.service
 remnanode-bittorrent-guard.service
+remnanode-ssh-peers-pull.timer
+remnanode-ssh-peers-pull.service
 docker.service
 docker.socket
 containerd.service
@@ -1907,6 +1927,7 @@ backup_system_paths() {
     "$SSH_PEERS_PUBLIC_KEY" "$SSH_PEERS_TOKEN" "$SSH_PEERS_NODE_IP" \
     "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" \
     "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" \
+    /usr/local/sbin/remnanode-bittorrent-guard.sh /etc/systemd/system/remnanode-bittorrent-guard.service \
     "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" "$TLS_DIR" "$PANEL_IPS_FILE" \
     "$COVER_ROOT/index.html" "$COVER_ROOT/404.html" "$HYSTERIA_MASQUERADE_FILE" \
     "$MASKED_BBR_CONTRACT_FILE" "$MASKED_BBR_PASSWORD_FILE" \
@@ -1933,6 +1954,8 @@ net.core.somaxconn
 net.core.netdev_max_backlog
 net.core.rmem_max
 net.core.wmem_max
+net.core.rmem_default
+net.core.wmem_default
 net.ipv4.ip_local_port_range
 net.ipv4.tcp_fastopen
 net.ipv4.tcp_fin_timeout
@@ -2125,6 +2148,7 @@ remove_known_current_files_for_rollback() {
     "$SSH_PEERS_PUBLIC_KEY" "$SSH_PEERS_TOKEN" "$SSH_PEERS_NODE_IP" \
     "$DNS_REFLECTION_GUARD_SCRIPT" "$DNS_REFLECTION_GUARD_SERVICE" \
     "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" \
+    /usr/local/sbin/remnanode-bittorrent-guard.sh /etc/systemd/system/remnanode-bittorrent-guard.service \
     "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" /etc/nginx/conf.d/00-remnanode-hash-tuning.conf \
     "$COVER_ROOT/index.html" "$COVER_ROOT/404.html" "$HYSTERIA_MASQUERADE_FILE" \
     "$MASKED_BBR_CONTRACT_FILE" "$MASKED_BBR_PASSWORD_FILE"
@@ -2355,11 +2379,11 @@ rollback_from_backup() {
   systemctl disable --now remnanode-ssh-peers-pull.timer >/dev/null 2>&1 || true
   for unit in remnanode-spamhaus-egress-guard.timer remnanode-spamhaus-egress-guard.service \
     remnanode-outbound-ssh-guard.service remnanode-ssh-peers.service \
-    remnanode-dns-reflection-guard.service remnanode-bittorrent-guard.service; do
+    remnanode-dns-reflection-guard.service vpn-torrent-guard.service; do
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
   done
   for unit in remnanode_spamhaus_egress_guard remnanode_outbound_ssh_guard \
-    remnanode_ssh_peers remnanode_dns_reflection_guard remnanode_bittorrent_guard; do
+    remnanode_ssh_peers remnanode_dns_reflection_guard vpn_torrent_guard; do
     nft delete table inet "$unit" >/dev/null 2>&1 || true
   done
   remove_bittorrent_string_runtime
@@ -2649,21 +2673,31 @@ stop_legacy_units() {
 }
 
 cleanup_legacy_firewall_runtime() {
-  local bin=""
   nft delete table inet remnanode_guard >/dev/null 2>&1 || true
-  # Keep the active Spamhaus table until its replacement has valid data.
+  # Keep the legacy BitTorrent policy until replacement is verified.
+}
 
+cleanup_legacy_bittorrent_runtime() {
+  local bin="" hook="" chain=""
+  # The replacement has already passed verification (or was explicitly disabled).
+  systemctl disable --now remnanode-bittorrent-guard.service >/dev/null 2>&1 || true
+  nft delete table inet remnanode_bittorrent_guard >/dev/null 2>&1 || true
   for bin in iptables ip6tables; do
     command -v "$bin" >/dev/null 2>&1 || continue
-    while "$bin" -w 3 -C OUTPUT -j REMNANODE_TORRENT_GUARD >/dev/null 2>&1; do
-      "$bin" -w 3 -D OUTPUT -j REMNANODE_TORRENT_GUARD || break
+    for hook in OUTPUT FORWARD; do
+      for chain in REMNANODE_TORRENT_GUARD REMNANODE_BT_OUT REMNANODE_BT_FWD REMNANODE_BT6_OUT REMNANODE_BT6_FWD; do
+        while "$bin" -w 3 -C "$hook" -j "$chain" >/dev/null 2>&1; do
+          "$bin" -w 3 -D "$hook" -j "$chain" || break
+        done
+      done
     done
-    while "$bin" -w 3 -C FORWARD -j REMNANODE_TORRENT_GUARD >/dev/null 2>&1; do
-      "$bin" -w 3 -D FORWARD -j REMNANODE_TORRENT_GUARD || break
+    for chain in REMNANODE_TORRENT_GUARD REMNANODE_BT_OUT REMNANODE_BT_FWD REMNANODE_BT6_OUT REMNANODE_BT6_FWD; do
+      "$bin" -w 3 -F "$chain" >/dev/null 2>&1 || true
+      "$bin" -w 3 -X "$chain" >/dev/null 2>&1 || true
     done
-    "$bin" -w 3 -F REMNANODE_TORRENT_GUARD >/dev/null 2>&1 || true
-    "$bin" -w 3 -X REMNANODE_TORRENT_GUARD >/dev/null 2>&1 || true
   done
+  rm -f /usr/local/sbin/remnanode-bittorrent-guard.sh /etc/systemd/system/remnanode-bittorrent-guard.service
+  systemctl daemon-reload
 }
 
 cleanup_legacy_files() {
@@ -2757,12 +2791,23 @@ configure_small_swap() {
   fi
 }
 
+sysctl_floor() {
+  local key="$1" floor="$2" current=""
+  current="$(sysctl -n "$key" 2>/dev/null || true)"
+  [[ "$current" =~ ^[0-9]+$ ]] || current=0
+  (( current > floor )) && floor="$current"
+  printf '%s' "$floor"
+}
+
 configure_minimal_sysctl() {
   local bbr_available=0
   local tmp=""
   local mem_mb=""
   local cpu_count=1
   local hysteria_expected=0
+  local socket_receive_default=1048576
+  local socket_send_default=1048576
+  local receive_max=0 send_max=0
   local socket_max=8388608
   local netdev_backlog=4096
   local syn_backlog=4096
@@ -2795,6 +2840,21 @@ configure_minimal_sysctl() {
     (( netdev_backlog < 32768 )) && netdev_backlog=32768
     (( syn_backlog < 16384 )) && syn_backlog=16384
   fi
+  if (( mem_mb >= 1536 )); then
+    socket_send_default=2097152
+    socket_receive_default=2097152
+    if (( hysteria_expected == 1 && mem_mb >= 3072 )); then
+      socket_receive_default=8388608
+    fi
+  fi
+  socket_receive_default="$(sysctl_floor net.core.rmem_default "$socket_receive_default")"
+  socket_send_default="$(sysctl_floor net.core.wmem_default "$socket_send_default")"
+  receive_max="$(sysctl_floor net.core.rmem_max "$socket_max")"
+  send_max="$(sysctl_floor net.core.wmem_max "$socket_max")"
+  (( receive_max < socket_receive_default )) && receive_max="$socket_receive_default"
+  (( send_max < socket_send_default )) && send_max="$socket_send_default"
+  netdev_backlog="$(sysctl_floor net.core.netdev_max_backlog "$netdev_backlog")"
+  syn_backlog="$(sysctl_floor net.ipv4.tcp_max_syn_backlog "$syn_backlog")"
   udp_mem_triplet="$(adaptive_udp_mem_triplet "$mem_mb" "$hysteria_expected")"
 
   tmp="$(mktemp)"
@@ -2803,8 +2863,10 @@ configure_minimal_sysctl() {
     printf 'fs.file-max = 2097152\n'
     printf 'net.core.somaxconn = %s\n' "$syn_backlog"
     printf 'net.core.netdev_max_backlog = %s\n' "$netdev_backlog"
-    printf 'net.core.rmem_max = %s\n' "$socket_max"
-    printf 'net.core.wmem_max = %s\n' "$socket_max"
+    printf 'net.core.rmem_max = %s\n' "$receive_max"
+    printf 'net.core.wmem_max = %s\n' "$send_max"
+    printf 'net.core.rmem_default = %s\n' "$socket_receive_default"
+    printf 'net.core.wmem_default = %s\n' "$socket_send_default"
     printf 'net.ipv4.ip_local_port_range = 10240 65535\n'
     printf 'net.ipv4.tcp_fastopen = 3\n'
     printf 'net.ipv4.tcp_fin_timeout = 15\n'
@@ -2850,7 +2912,7 @@ configure_minimal_sysctl() {
     [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" == "bbr" ]] || \
       warn "BBR доступен, но provider не разрешил сделать его активным."
   fi
-  log "Adaptive network baseline: CPU=${cpu_count}, RAM=${mem_mb}MiB, socket-max=$socket_max, udp-mem=[$udp_mem_triplet], backlog=$netdev_backlog"
+  log "Adaptive network baseline: CPU=${cpu_count}, RAM=${mem_mb}MiB, socket-max=$receive_max/$send_max, defaults=$socket_receive_default/$socket_send_default, udp-mem=[$udp_mem_triplet], backlog=$netdev_backlog"
 }
 
 configure_quic_runtime_tuning() {
@@ -3226,10 +3288,10 @@ write_firewall() {
   [[ -z "$nft_tcp_ports" ]] || public_tcp_rule="        tcp dport { $nft_tcp_ports } accept"
   [[ -z "$nft_udp_ports" ]] || public_udp_rule="        udp dport { $nft_udp_ports } accept"
   if bool_true "$BLOCK_SMTP_EGRESS"; then
-    smtp_output_rule="        tcp dport { $nft_smtp_ports } reject with tcp reset"
+    smtp_output_rule="        ct direction original tcp dport { $nft_smtp_ports } reject with tcp reset"
   fi
   if bool_true "$BLOCK_SMTP_FORWARD"; then
-    smtp_forward_rule="        tcp dport { $nft_smtp_ports } reject with tcp reset"
+    smtp_forward_rule="        ct direction original tcp dport { $nft_smtp_ports } reject with tcp reset"
   fi
 
   cat >"$FIREWALL_SCRIPT" <<EOF
@@ -3347,13 +3409,13 @@ remove_bittorrent_string_runtime() {
   for bin in iptables ip6tables; do
     command -v "$bin" >/dev/null 2>&1 || continue
     for hook in OUTPUT FORWARD; do
-      for chain in REMNANODE_BT_OUT REMNANODE_BT_FWD REMNANODE_BT6_OUT REMNANODE_BT6_FWD; do
+      for chain in VPN_BT_OUT VPN_BT_FWD VPN_BT6_OUT VPN_BT6_FWD; do
         while "$bin" -w 3 -C "$hook" -j "$chain" >/dev/null 2>&1; do
           "$bin" -w 3 -D "$hook" -j "$chain" || break
         done
       done
     done
-    for chain in REMNANODE_BT_OUT REMNANODE_BT_FWD REMNANODE_BT6_OUT REMNANODE_BT6_FWD; do
+    for chain in VPN_BT_OUT VPN_BT_FWD VPN_BT6_OUT VPN_BT6_FWD; do
       "$bin" -w 3 -F "$chain" >/dev/null 2>&1 || true
       "$bin" -w 3 -X "$chain" >/dev/null 2>&1 || true
     done
@@ -3390,52 +3452,104 @@ trap cleanup EXIT
 
 RAW="$WORKDIR/raw.txt"
 ELEMENTS="$WORKDIR/drop_v4.nft"
+RAW_V6="$WORKDIR/raw-v6.txt"
+ELEMENTS_V6="$WORKDIR/drop_v6.nft"
 RULES="$WORKDIR/rules.nft"
 : >"$RAW"
+: >"$RAW_V6"
+CACHE_DIR="${REMNANODE_SPAMHAUS_CACHE_DIR:-/var/lib/remnanode-installer/spamhaus-cache}"
 
 fetch_url() {
   local url="$1"
   if command -v curl >/dev/null 2>&1; then
-    curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 "$url"
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+      --connect-timeout 10 --max-time 25 --retry 1 --retry-max-time 45 --retry-delay 2 "$url"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- "$url"
+    wget --https-only --timeout=25 --tries=2 -qO- "$url"
   else
     return 1
   fi
 }
 
-# EDROP was consolidated into DROP; do not depend on the retired endpoint.
-for url in "https://www.spamhaus.org/drop/drop.txt"; do
-  fetch_url "$url" >>"$RAW" || true
-  printf '\n' >>"$RAW"
-done
+# Official Spamhaus DROP datasets cover both address families. Keep the text
+# fallback for IPv4, but never replace an existing policy with a partial list.
+if ! "$NFT" list table inet remnanode_spamhaus_egress_guard >/dev/null 2>&1 && \
+   [[ -s "$CACHE_DIR/ipv4.raw" && -s "$CACHE_DIR/ipv6.raw" ]]; then
+  # Boot restores protection immediately; the periodic timer refreshes it.
+  cp "$CACHE_DIR/ipv4.raw" "$RAW"
+  cp "$CACHE_DIR/ipv6.raw" "$RAW_V6"
+else
+  fetch_url "https://www.spamhaus.org/drop/drop_v4.json" >"$RAW" || {
+    : >"$RAW"
+    fetch_url "https://www.spamhaus.org/drop/drop.txt" >"$RAW" || true
+  }
+  fetch_url "https://www.spamhaus.org/drop/drop_v6.json" >"$RAW_V6" || true
+fi
 
 if [[ -s "$RAW" ]]; then
-  "$PYTHON" - "$RAW" "$ELEMENTS" <<'PY'
+  "$PYTHON" - "$RAW" "$ELEMENTS" "$RAW_V6" "$ELEMENTS_V6" <<'PY'
 import ipaddress
+import json
 import sys
 
-raw_path, out_path = sys.argv[1:3]
-networks = []
-with open(raw_path, "r", encoding="utf-8", errors="ignore") as handle:
-    for line in handle:
-        item = line.split(";", 1)[0].strip()
-        if not item:
-            continue
-        try:
-            network = ipaddress.ip_network(item, strict=False)
-        except ValueError:
-            continue
-        if network.version == 4:
-            networks.append(network)
+def convert(raw_path, out_path, version):
+    networks = []
+    with open(raw_path, "r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            item = line.split(";", 1)[0].strip()
+            if not item:
+                continue
+            try:
+                if item.startswith("{"):
+                    item = json.loads(item).get("cidr", "")
+                network = ipaddress.ip_network(item, strict=False)
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if network.version == version:
+                networks.append(network)
+    collapsed = list(ipaddress.collapse_addresses(networks))
+    with open(out_path, "w", encoding="utf-8") as handle:
+        if collapsed:
+            handle.write("elements = { ")
+            handle.write(", ".join(str(network) for network in collapsed))
+            handle.write(" };\n")
 
-collapsed = list(ipaddress.collapse_addresses(networks))
-with open(out_path, "w", encoding="utf-8") as handle:
-    if collapsed:
-        handle.write("elements = { ")
-        handle.write(", ".join(str(network) for network in collapsed))
-        handle.write(" };\n")
+convert(sys.argv[1], sys.argv[2], 4)
+convert(sys.argv[3], sys.argv[4], 6)
 PY
+fi
+
+# Keep a private, validated last-known list for a boot without network access.
+# An update failure while a table is already active leaves that table intact.
+if [[ ! -s "$ELEMENTS" || ! -s "$ELEMENTS_V6" ]]; then
+  if "$NFT" list table inet remnanode_spamhaus_egress_guard >/dev/null 2>&1; then
+    echo "Spamhaus update failed; preserving the active rules." >&2
+    exit 1
+  fi
+  if [[ -s "$CACHE_DIR/ipv4.raw" && -s "$CACHE_DIR/ipv6.raw" ]]; then
+    "$PYTHON" - "$CACHE_DIR/ipv4.raw" "$ELEMENTS" "$CACHE_DIR/ipv6.raw" "$ELEMENTS_V6" <<'PY'
+import ipaddress
+import json
+import sys
+
+for raw, output, family in [(sys.argv[1], sys.argv[2], 4), (sys.argv[3], sys.argv[4], 6)]:
+    networks = []
+    for line in open(raw, encoding="utf-8"):
+        item = line.split(";", 1)[0].strip()
+        try:
+            if item.startswith("{"):
+                item = json.loads(item).get("cidr", "")
+            net = ipaddress.ip_network(item, strict=False)
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if net.version == family:
+            networks.append(net)
+    with open(output, "w", encoding="utf-8") as handle:
+        if networks:
+            handle.write("elements = { " + ", ".join(map(str, ipaddress.collapse_addresses(networks))) + " };\n")
+PY
+    echo "Spamhaus network fetch unavailable; restoring validated last-known lists." >&2
+  fi
 fi
 
 if "$NFT" list table inet remnanode_spamhaus_egress_guard >/dev/null 2>&1; then
@@ -3445,10 +3559,12 @@ else
 fi
 
 elements_block=""
-if [[ -s "$ELEMENTS" ]]; then
+elements_v6_block=""
+if [[ -s "$ELEMENTS" && -s "$ELEMENTS_V6" ]]; then
   elements_block="$(sed 's/^/        /' "$ELEMENTS")"
+  elements_v6_block="$(sed 's/^/        /' "$ELEMENTS_V6")"
 else
-  echo "Spamhaus DROP is unavailable or empty; keeping the previous rules intact and retrying on the timer." >&2
+  echo "Spamhaus DROP IPv4/IPv6 is unavailable or empty; keeping the previous rules intact and retrying on the timer." >&2
   exit 1
 fi
 
@@ -3461,22 +3577,55 @@ table inet remnanode_spamhaus_egress_guard {
 $elements_block
     }
 
+    set drop_v6 {
+        type ipv6_addr;
+        flags interval;
+        auto-merge;
+$elements_v6_block
+    }
+
     chain output {
         type filter hook output priority -11; policy accept;
         ct state established,related accept
         ip daddr @drop_v4 counter reject with icmpx type admin-prohibited
+        ip6 daddr @drop_v6 counter reject with icmpx type admin-prohibited
     }
 
     chain forward {
         type filter hook forward priority -11; policy accept;
         ct state established,related accept
         ip daddr @drop_v4 counter reject with icmpx type admin-prohibited
+        ip6 daddr @drop_v6 counter reject with icmpx type admin-prohibited
     }
 }
 NFT
 
 "$NFT" -c -f "$RULES"
 "$NFT" -f "$RULES"
+# Only save a complete fresh pair after successful validation and application.
+if [[ -s "$RAW" && -s "$RAW_V6" ]] && \
+   "$PYTHON" - "$RAW" "$RAW_V6" <<'PY'
+import ipaddress, json, sys
+for path, family in zip(sys.argv[1:], (4, 6)):
+    count = 0
+    for line in open(path, encoding="utf-8"):
+        item = line.split(";", 1)[0].strip()
+        try:
+            if item.startswith("{"):
+                item = json.loads(item).get("cidr", "")
+            count += ipaddress.ip_network(item, strict=False).version == family
+        except (ValueError, TypeError, AttributeError):
+            pass
+    if not count:
+        raise SystemExit(1)
+PY
+then
+  install -d -m 0700 "$CACHE_DIR"
+  install -m 0600 "$RAW" "$CACHE_DIR/ipv4.raw.tmp"
+  install -m 0600 "$RAW_V6" "$CACHE_DIR/ipv6.raw.tmp"
+  mv -f "$CACHE_DIR/ipv4.raw.tmp" "$CACHE_DIR/ipv4.raw"
+  mv -f "$CACHE_DIR/ipv6.raw.tmp" "$CACHE_DIR/ipv6.raw"
+fi
 EOF
   chmod 0700 "$SPAMHAUS_EGRESS_GUARD_SCRIPT"
 
@@ -3491,6 +3640,7 @@ Before=docker.service
 [Service]
 Type=oneshot
 ExecStart=$SPAMHAUS_EGRESS_GUARD_SCRIPT
+TimeoutStartSec=180s
 # Must return to inactive, otherwise the periodic timer will not rerun it.
 RemainAfterExit=no
 
@@ -3543,11 +3693,13 @@ cat >>"$RULES" <<'NFT'
 table inet remnanode_outbound_ssh_guard {
     chain output {
         type filter hook output priority -8; policy accept;
+        ct direction reply accept
         tcp dport 22 counter reject with icmpx type admin-prohibited
     }
 
     chain forward {
         type filter hook forward priority -8; policy accept;
+        ct direction reply accept
         tcp dport 22 counter reject with icmpx type admin-prohibited
     }
 }
@@ -3783,6 +3935,7 @@ $resolver_v6_block
 
     chain output {
         type filter hook output priority -9; policy accept;
+        ct direction reply accept
         oifname "lo" udp dport 53 accept
         oifname "lo" tcp dport 53 accept
         ip daddr 127.0.0.0/8 udp dport 53 accept
@@ -3796,6 +3949,7 @@ $resolver_rules
 
     chain forward {
         type filter hook forward priority -9; policy accept;
+        ct direction reply accept
         udp dport 53 counter reject with icmpx type admin-prohibited
         tcp dport 53 counter reject with icmpx type admin-prohibited
     }
@@ -3833,6 +3987,7 @@ EOF
 write_bittorrent_guard() {
   cat >"$BITTORRENT_GUARD_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
+# managed-by: bt-deploy-20261028
 set -Eeuo pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -3903,36 +4058,42 @@ install_string_rules() {
   done
 }
 
-if "$NFT" list table inet remnanode_bittorrent_guard >/dev/null 2>&1; then
-  printf '%s\n' 'delete table inet remnanode_bittorrent_guard' >"$RULES"
+if "$NFT" list table inet vpn_torrent_guard >/dev/null 2>&1; then
+  printf '%s\n' 'delete table inet vpn_torrent_guard' >"$RULES"
 else
   : >"$RULES"
 fi
 
 cat >>"$RULES" <<'NFT'
-table inet remnanode_bittorrent_guard {
+table inet vpn_torrent_guard {
+    chain input {
+        type filter hook input priority -7; policy accept;
+        ct state new tcp dport { 6881-6999, 2710, 16881, 51413, 53442 } counter reject with icmpx type admin-prohibited
+        ct state new udp dport { 6881-6999, 2710, 16881, 51413, 53442 } counter reject with icmpx type admin-prohibited
+    }
+
     chain output {
         type filter hook output priority -7; policy accept;
-        tcp dport 6881-6999 counter reject with icmpx type admin-prohibited
-        udp dport 6881-6999 counter reject with icmpx type admin-prohibited
-        tcp dport { 2710, 6969, 16881, 51413 } counter reject with icmpx type admin-prohibited
-        udp dport { 2710, 6969, 16881, 51413 } counter reject with icmpx type admin-prohibited
+        ct direction original tcp dport 6881-6999 counter reject with icmpx type admin-prohibited
+        ct direction original udp dport 6881-6999 counter reject with icmpx type admin-prohibited
+        ct direction original tcp dport { 2710, 6969, 16881, 51413, 53442 } counter reject with icmpx type admin-prohibited
+        ct direction original udp dport { 2710, 6969, 16881, 51413, 53442 } counter reject with icmpx type admin-prohibited
     }
 
     chain forward {
         type filter hook forward priority -7; policy accept;
-        tcp dport 6881-6999 counter reject with icmpx type admin-prohibited
-        udp dport 6881-6999 counter reject with icmpx type admin-prohibited
-        tcp dport { 2710, 6969, 16881, 51413 } counter reject with icmpx type admin-prohibited
-        udp dport { 2710, 6969, 16881, 51413 } counter reject with icmpx type admin-prohibited
+        ct direction original tcp dport 6881-6999 counter reject with icmpx type admin-prohibited
+        ct direction original udp dport 6881-6999 counter reject with icmpx type admin-prohibited
+        ct direction original tcp dport { 2710, 6969, 16881, 51413, 53442 } counter reject with icmpx type admin-prohibited
+        ct direction original udp dport { 2710, 6969, 16881, 51413, 53442 } counter reject with icmpx type admin-prohibited
     }
 }
 NFT
 
 "$NFT" -c -f "$RULES"
 "$NFT" -f "$RULES"
-install_string_rules "$IPTABLES" REMNANODE_BT_OUT REMNANODE_BT_FWD
-install_string_rules "$IP6TABLES" REMNANODE_BT6_OUT REMNANODE_BT6_FWD
+install_string_rules "$IPTABLES" VPN_BT_OUT VPN_BT_FWD
+install_string_rules "$IP6TABLES" VPN_BT6_OUT VPN_BT6_FWD
 EOF
   chmod 0700 "$BITTORRENT_GUARD_SCRIPT"
 
@@ -3954,8 +4115,8 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now remnanode-bittorrent-guard.service >/dev/null
-  systemctl restart remnanode-bittorrent-guard.service
+  systemctl enable --now vpn-torrent-guard.service >/dev/null
+  systemctl restart vpn-torrent-guard.service
 }
 
 configure_antiabuse_guards() {
@@ -3984,39 +4145,94 @@ configure_antiabuse_guards() {
     write_bittorrent_guard
   else
     disable_guard_unit "$BITTORRENT_GUARD_SCRIPT" "$BITTORRENT_GUARD_SERVICE" "" \
-      remnanode_bittorrent_guard
+      vpn_torrent_guard
     remove_bittorrent_string_runtime
   fi
 }
 
-install_ssh_peers_pull_module() {
-  local source_file="" source_url=""
-  source_file="$(mktemp /tmp/remnanode-ssh-peers.XXXXXX)"
-  source_url="https://raw.githubusercontent.com/${INSTALLER_REPO}/${INSTALLER_REF}/bin/remnanode-ssh-peers"
-  if [[ -f "$(dirname "${BASH_SOURCE[0]}")/bin/remnanode-ssh-peers" ]]; then
-    cp "$(dirname "${BASH_SOURCE[0]}")/bin/remnanode-ssh-peers" "$source_file"
-  else
-    curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --retry 4 \
-      "$source_url" -o "$source_file"
+verify_antiabuse_guards() {
+  local spec="" bin="" out_chain="" fwd_chain=""
+  if bool_true "$MANAGE_FIREWALL"; then
+    nft list table inet remnanode_installer >/dev/null 2>&1 || die "Control/SMTP firewall table is missing."
   fi
-  python3 -m py_compile "$source_file"
-  install -m 0700 -o root -g root "$source_file" /usr/local/sbin/remnanode-ssh-peers
-  rm -f "$source_file"
+  if bool_true "$ENABLE_SPAMHAUS_EGRESS_GUARD"; then
+    systemctl is-active --quiet remnanode-spamhaus-egress-guard.timer || die "Spamhaus refresh timer is not active."
+    nft list set inet remnanode_spamhaus_egress_guard drop_v4 >/dev/null 2>&1 || die "Spamhaus IPv4 policy is missing."
+    nft list set inet remnanode_spamhaus_egress_guard drop_v6 >/dev/null 2>&1 || die "Spamhaus IPv6 policy is missing."
+  fi
+  if bool_true "$ENABLE_OUTBOUND_SSH_GUARD"; then
+    systemctl is-active --quiet remnanode-outbound-ssh-guard.service || die "Outbound SSH guard is not active."
+    nft list table inet remnanode_outbound_ssh_guard >/dev/null 2>&1 || die "Outbound SSH guard table is missing."
+  fi
+  if bool_true "$ENABLE_DNS_REFLECTION_GUARD"; then
+    systemctl is-active --quiet remnanode-dns-reflection-guard.service || die "DNS reflection guard is not active."
+    nft list table inet remnanode_dns_reflection_guard >/dev/null 2>&1 || die "DNS reflection guard table is missing."
+  fi
+  if bool_true "$ENABLE_BITTORRENT_GUARD"; then
+    systemctl is-active --quiet vpn-torrent-guard.service || die "BitTorrent guard service is not active."
+    nft list table inet vpn_torrent_guard >/dev/null 2>&1 || die "BitTorrent guard table is missing."
+    for spec in 'iptables VPN_BT_OUT VPN_BT_FWD' 'ip6tables VPN_BT6_OUT VPN_BT6_FWD'; do
+      read -r bin out_chain fwd_chain <<<"$spec"
+      if [[ "$bin" == ip6tables && -r /proc/sys/net/ipv6/conf/all/disable_ipv6 && "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" == 1 ]]; then
+        continue
+      fi
+      "$bin" -w 3 -C OUTPUT -j "$out_chain" >/dev/null 2>&1 || die "BitTorrent $bin OUTPUT signatures are missing; legacy policy retained."
+      "$bin" -w 3 -C FORWARD -j "$fwd_chain" >/dev/null 2>&1 || die "BitTorrent $bin FORWARD signatures are missing; legacy policy retained."
+    done
+  fi
+  return 0
+}
 
-  source_file="$(mktemp /tmp/remnanode-ssh-peers-pull.XXXXXX)"
-  source_url="https://raw.githubusercontent.com/${INSTALLER_REPO}/${INSTALLER_REF}/bin/remnanode-ssh-peers-pull"
-  if [[ -f "$(dirname "${BASH_SOURCE[0]}")/bin/remnanode-ssh-peers-pull" ]]; then
-    cp "$(dirname "${BASH_SOURCE[0]}")/bin/remnanode-ssh-peers-pull" "$source_file"
+install_verified_python_module() (
+  local name="$1" target="$2" expected="$3" source_file="" local_source="" attempt=0
+  source_file="$(mktemp /tmp/remnanode-module.XXXXXX)"
+  trap 'rm -f "$source_file"' EXIT
+  local_source="$(dirname "${BASH_SOURCE[0]}")/bin/$name"
+  if [[ -f "$local_source" && ! -L "$local_source" ]]; then
+    cp "$local_source" "$source_file"
   else
-    curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --retry 4 \
-      "$source_url" -o "$source_file"
+    for attempt in 1 2 3; do
+      if curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+          --connect-timeout 10 --max-time 40 --retry 1 --retry-max-time 60 \
+          -H 'Cache-Control: no-cache, no-store' \
+          "https://raw.githubusercontent.com/${INSTALLER_REPO}/${INSTALLER_REF}/bin/$name?installer=${INSTALLER_VERSION}-${attempt}-$(date +%s)" -o "$source_file" &&
+         [[ "$(sha256sum "$source_file" | awk '{print $1}')" == "$expected" ]]; then
+        break
+      fi
+      (( attempt == 3 )) && die "Не удалось получить проверенный модуль $name."
+    done
   fi
-  python3 -m py_compile "$source_file"
-  install -m 0700 -o root -g root "$source_file" "$SSH_PEERS_PULL_SCRIPT"
-  rm -f "$source_file"
+  [[ "$(sha256sum "$source_file" | awk '{print $1}')" == "$expected" ]] || die "Контрольная сумма модуля $name не совпадает."
+  python3 - "$source_file" <<'PYMODULE'
+import ast, pathlib, sys
+ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+PYMODULE
+  install -m 0700 -o root -g root "$source_file" "$target"
+)
+
+install_ssh_peers_pull_module() {
+  install_verified_python_module remnanode-ssh-peers "$SSH_PEERS_SCRIPT" '4639df3bd01ac6ef292e94ba69ed1a09689fcf1a0216c2b2535112840c7994db'
+  install_verified_python_module remnanode-ssh-peers-pull "$SSH_PEERS_PULL_SCRIPT" 'fa12241e027b1b03eccd5611b656e83a4a3b0b9c2cefce61e47872f7363c1956'
+  # Rebuild hooks/exemptions immediately after guard replacement. The current
+  # signed generation may already be applied, so a timer tick alone is insufficient.
+  if [[ -f "$SSH_PEERS_FILE" ]]; then
+    require_trusted_root_file "$SSH_PEERS_FILE"
+    "$SSH_PEERS_SCRIPT" install-hooks
+    log "Сохраненный список разрешенных SSH-IP восстановлен."
+  fi
+  log "Подключаю мониторинг по HTTPS с проверкой сертификата ноды."
+  if printf '%s' "$SECRET_VALUE" | timeout 120 "$SSH_PEERS_PULL_SCRIPT" enroll; then
+    log "Мониторинг подтвердил регистрацию этой ноды по её сертификату."
+  else
+    warn "Не удалось подключиться к мониторингу. Нода должна быть в его опубликованном списке; сохраненные токен и IP не удалены."
+  fi
   if [[ -s "$SSH_PEERS_TOKEN" && -s "$SSH_PEERS_NODE_IP" ]]; then
     "$SSH_PEERS_PULL_SCRIPT" install-hooks
-    log "HTTPS-получатель списка IP активирован."
+    if timeout 180 "$SSH_PEERS_PULL_SCRIPT" sync; then
+      log "Подписанный список разрешенных IP получен и применен."
+    else
+      warn "Мониторинг временно недоступен или список еще не опубликован. Получатель повторит запрос; действующие разрешения сохранены."
+    fi
   else
     log "HTTPS-получатель списка IP установлен; ожидание индивидуального токена ноды."
   fi
@@ -6187,6 +6403,7 @@ write_state() {
     printf 'SAVED_ENABLE_OUTBOUND_SSH_GUARD=%q\n' "$ENABLE_OUTBOUND_SSH_GUARD"
     printf 'SAVED_ENABLE_DNS_REFLECTION_GUARD=%q\n' "$ENABLE_DNS_REFLECTION_GUARD"
     printf 'SAVED_ENABLE_BITTORRENT_GUARD=%q\n' "$ENABLE_BITTORRENT_GUARD"
+    printf 'SAVED_BITTORRENT_POLICY_V2=1\n'
     printf 'SAVED_ENABLE_BBR=%q\n' "$ENABLE_BBR"
     printf 'SAVED_ENABLE_QUIC_TUNING=%q\n' "$ENABLE_QUIC_TUNING"
     printf 'SAVED_AUTO_SWAP=%q\n' "$AUTO_SWAP"
@@ -6336,7 +6553,7 @@ PY
   fi
   nft list table inet remnanode_outbound_ssh_guard >/dev/null 2>&1 && outbound_ssh_guard="active"
   nft list table inet remnanode_dns_reflection_guard >/dev/null 2>&1 && dns_reflection_guard="active"
-  nft list table inet remnanode_bittorrent_guard >/dev/null 2>&1 && bittorrent_guard="active"
+  nft list table inet vpn_torrent_guard >/dev/null 2>&1 && bittorrent_guard="active"
 
   printf 'Installer:       %s\n' "$INSTALLER_VERSION"
   printf 'Container:       %s\n' "$state"
@@ -6457,6 +6674,8 @@ run_install() {
   activate_node
   start_xhttp_socket_guard
   verify_node
+  verify_antiabuse_guards
+  cleanup_legacy_bittorrent_runtime
   refresh_dns_reflection_guard_runtime
   write_state
   restore_security_timers_if_legacy

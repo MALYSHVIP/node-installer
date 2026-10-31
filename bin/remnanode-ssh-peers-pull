@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Pull and verify a signed SSH peer list. Never accepts an unsigned update."""
 import base64
+import fcntl
+import stat
 import hashlib
 import hmac
 import ipaddress
@@ -13,6 +15,7 @@ import tempfile
 import time
 
 URL = 'https://api.chernakovgame.ru/api/ssh-peers/manifest.php'
+ENROLL_URL = 'https://api.chernakovgame.ru/api/ssh-peers/enroll.php'
 ACK_URL = 'https://api.chernakovgame.ru/api/ssh-peers/ack.php'
 PUBLIC_KEY = Path('/etc/remnanode/ssh-peers-signing.pub')
 PUBLIC_KEY_SHA256 = '0e2d38540c5c693a8ce4d2c5a39bafa8089c5b06d03caa309a1e4a250660cba9'
@@ -41,6 +44,7 @@ def https(*args, input_bytes=None, timeout=16):
     for attempt in range(1, 4):
         try:
             return run('curl', '-4', '-fsS', '--proto', '=https',
+                       '--proto-redir', '=https', '--tlsv1.2', '--max-filesize', '65536',
                        '--connect-timeout', '7', '--max-time', '12',
                        *args, input_bytes=input_bytes, timeout=timeout)
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
@@ -65,7 +69,17 @@ def atomic_write(path, value, mode=0o600):
             os.unlink(name)
 
 
+def trusted_file(path):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError('unsafe managed file permissions: ' + path.name)
+
+
 def node_identity():
+    trusted_file(NODE_IP_FILE)
+    trusted_file(TOKEN_FILE)
+    if TOKEN_FILE.stat().st_mode & 0o077:
+        raise ValueError('node token must only be readable by root')
     ip = NODE_IP_FILE.read_text().strip()
     address = ipaddress.ip_address(ip)
     if not isinstance(address, ipaddress.IPv4Address) or not address.is_global:
@@ -77,6 +91,7 @@ def node_identity():
 
 
 def verify_signature(payload, signature):
+    trusted_file(PUBLIC_KEY)
     if hashlib.sha256(PUBLIC_KEY.read_bytes()).hexdigest() != PUBLIC_KEY_SHA256:
         raise ValueError('untrusted signing public key')
     canonical = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
@@ -143,6 +158,23 @@ def fetch_manifest(ip, token):
 
 
 def sync():
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock = STATE_FILE.with_suffix('.lock')
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+            raise ValueError('unsafe sync lock permissions')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('IP synchronization is already running') from None
+        sync_locked()
+    finally:
+        os.close(fd)
+
+
+def sync_locked():
     ip, token = node_identity()
     raw = fetch_manifest(ip, token)
     if len(raw) > 65536:
@@ -154,13 +186,21 @@ def sync():
     canonical = verify_signature(payload, envelope['signature'])
     peers = validate_payload(payload, ip)
     digest = hashlib.sha256(canonical).hexdigest()
+    if STATE_FILE.exists():
+        trusted_file(STATE_FILE)
     old = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     generation = payload['generation']
     if generation < int(old.get('generation', 0)):
         raise ValueError('manifest rollback detected')
     if generation == old.get('generation') and digest != old.get('digest'):
         raise ValueError('generation collision')
-    if generation > int(old.get('generation', 0)):
+    needs_apply = generation > int(old.get('generation', 0))
+    if not needs_apply and not MASTER_MODE.exists():
+        try:
+            run(APPLIER, 'verify', timeout=15)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            needs_apply = True
+    if needs_apply:
         peer_text = ''.join(value + '\n' for value in peers).encode()
         applier = MASTER_APPLIER if MASTER_MODE.exists() else APPLIER
         try:
@@ -176,13 +216,72 @@ def sync():
     send_ack(ip, token, generation, digest, 'applied')
 
 
+def enroll():
+    # SECRET_KEY is read from stdin, never from argv or sent to monitoring.
+    raw = sys.stdin.buffer.read(131073).strip()
+    if len(raw) > 131072:
+        raise ValueError('node secret is too large')
+    payload = json.loads(base64.urlsafe_b64decode(raw + b'=' * (-len(raw) % 4)))
+    cert, key = payload['nodeCertPem'], payload['nodeKeyPem']
+    if not isinstance(cert, str) or not isinstance(key, str):
+        raise ValueError('invalid node identity')
+    challenge = json.loads(https(ENROLL_URL))
+    ip = str(ipaddress.IPv4Address(challenge['ip']))
+    if not ipaddress.ip_address(ip).is_global:
+        raise ValueError('invalid enrollment IP')
+    stamp, nonce, auth = (challenge[k] for k in ('time', 'nonce', 'challenge'))
+    if (not isinstance(stamp, str) or len(stamp) != 10 or not stamp.isdigit() or
+            abs(time.time() - int(stamp)) > 180 or
+            any(not isinstance(v, str) or len(v) != 64 or
+                any(c not in '0123456789abcdef' for c in v) for v in (nonce, auth))):
+        raise ValueError('invalid enrollment challenge')
+    signed = f'node-enroll-v1\n{ip}\n{stamp}\n{nonce}\n{auth}'.encode()
+    with tempfile.TemporaryDirectory(prefix='node-enroll-') as directory:
+        key_path = Path(directory) / 'key.pem'
+        atomic_write(key_path, key.encode())
+        proof = run('openssl', 'dgst', '-sha256', '-sign', str(key_path),
+                    input_bytes=signed, timeout=15)
+    body = json.dumps({**challenge, 'certificate': cert,
+                       'proof': base64.b64encode(proof).decode()},
+                      sort_keys=True, separators=(',', ':')).encode()
+    result = json.loads(https('-H', 'Content-Type: application/json',
+                             '--data-binary', '@-', ENROLL_URL, input_bytes=body))
+    token = result.get('token', '')
+    if (result.get('ip') != ip or
+            result.get('signing_public_key_sha256') != PUBLIC_KEY_SHA256 or
+            not isinstance(token, str) or len(token) != 64 or
+            any(c not in '0123456789abcdef' for c in token)):
+        raise ValueError('invalid monitoring enrollment response')
+    # Commit credentials only after the authenticated HTTPS exchange succeeds.
+    previous = {}
+    for path in (TOKEN_FILE, NODE_IP_FILE):
+        if path.exists() or path.is_symlink():
+            trusted_file(path)
+            previous[path] = path.read_bytes()
+        else:
+            previous[path] = None
+    try:
+        atomic_write(TOKEN_FILE, (token + '\n').encode())
+        atomic_write(NODE_IP_FILE, (ip + '\n').encode())
+    except Exception:
+        for path, value in previous.items():
+            if value is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write(path, value)
+        raise
+    print('ENROLLED ip=' + ip)
+
+
 def install_hooks():
     if not PUBLIC_KEY.exists():
         atomic_write(PUBLIC_KEY, PUBLIC_KEY_PEM, 0o644)
+    trusted_file(PUBLIC_KEY)
     if hashlib.sha256(PUBLIC_KEY.read_bytes()).hexdigest() != PUBLIC_KEY_SHA256:
         raise ValueError('untrusted signing public key')
     if not TOKEN_FILE.exists() or not NODE_IP_FILE.exists():
         raise ValueError('node token and IP must be provisioned before enabling pull')
+    node_identity()
     service = Path('/etc/systemd/system/remnanode-ssh-peers-pull.service')
     timer = Path('/etc/systemd/system/remnanode-ssh-peers-pull.timer')
     service.write_text('''[Unit]
@@ -193,6 +292,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/remnanode-ssh-peers-pull sync
+TimeoutStartSec=240
 ''')
     timer.write_text('''[Unit]
 Description=Regular signed SSH peer list retrieval
@@ -214,8 +314,10 @@ def main():
     if os.geteuid():
         raise PermissionError('root required')
     if len(sys.argv) != 2:
-        raise ValueError('usage: remnanode-ssh-peers-pull sync|install-hooks')
-    if sys.argv[1] == 'sync':
+        raise ValueError('usage: remnanode-ssh-peers-pull sync|install-hooks|enroll')
+    if sys.argv[1] == 'enroll':
+        enroll()
+    elif sys.argv[1] == 'sync':
         sync()
     elif sys.argv[1] == 'install-hooks':
         install_hooks()

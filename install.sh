@@ -2,12 +2,15 @@
 set -Eeuo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
-BOOTSTRAP_VERSION="1.2.6"
+BOOTSTRAP_VERSION="1.2.7"
+# Capture at top level: inside a stdin-defined function Bash reports "main".
+BOOTSTRAP_SOURCE_PATH="${BASH_SOURCE[0]:-}"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
+INSTALLER_REQUESTED_REF="$INSTALLER_REF"
 export INSTALLER_REPO INSTALLER_REF
 INSTALLER_FILE="${INSTALLER_FILE:-setup-remnanode.sh}"
-MIN_MAIN_INSTALLER_VERSION="4.1.5"
+MIN_MAIN_INSTALLER_VERSION="4.1.8"
 DOWNLOAD_ATTEMPTS=3
 TMP_FILE=""
 LOCAL_INSTALLER_USED=0
@@ -78,7 +81,7 @@ run_local_installer() {
   local rc=0
   local script_dir=""
   local local_installer=""
-  local source_path="${BASH_SOURCE[0]:-}"
+  local source_path="${BOOTSTRAP_SOURCE_PATH:-}"
 
   # When invoked as `curl ... | bash`, Bash has no source filename. In that
   # mode skip local discovery and download the pinned installer as intended.
@@ -117,7 +120,7 @@ version_ge() {
 
 expected_main_installer() {
   [[ "$INSTALLER_REPO" == "MALYSHVIP/node-installer" && \
-     "$INSTALLER_REF" == "main" && \
+     "$INSTALLER_REQUESTED_REF" == "main" && \
      "$INSTALLER_FILE" == "setup-remnanode.sh" ]]
 }
 
@@ -154,12 +157,34 @@ download_url() {
   die "curl or wget is required"
 }
 
+resolve_download_ref() {
+  local response="" resolved=""
+  [[ "$INSTALLER_REF" =~ ^[a-f0-9]{40}$ ]] && return 0
+  # Pin the main script and its modules to one snapshot. If the GitHub API is
+  # temporarily rate-limited, per-module SHA256 checks still reject mixed files.
+  if command -v curl >/dev/null 2>&1; then
+    response="$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+      --connect-timeout 5 --max-time 12 --retry 1 --retry-max-time 20 \
+      -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/repos/${INSTALLER_REPO}/commits/${INSTALLER_REF}" 2>/dev/null || true)"
+    resolved="$(printf '%s' "$response" | awk -F'"' '$2 == "sha" && !found {print $4; found=1}')"
+    if [[ "$resolved" =~ ^[a-f0-9]{40}$ ]]; then
+      INSTALLER_REF="$resolved"
+      export INSTALLER_REF
+      log "snapshot=$INSTALLER_REF requested=$INSTALLER_REQUESTED_REF"
+      return 0
+    fi
+  fi
+  log "GitHub snapshot API unavailable; using verified module digests with ref=$INSTALLER_REF"
+}
+
 download_installer() {
   local base_url=""
   local url=""
   local nonce=""
   local attempt=1
 
+  resolve_download_ref
   base_url="https://raw.githubusercontent.com/${INSTALLER_REPO}/${INSTALLER_REF}/${INSTALLER_FILE}"
   log "source=github repo=${INSTALLER_REPO} ref=${INSTALLER_REF} file=${INSTALLER_FILE}"
 

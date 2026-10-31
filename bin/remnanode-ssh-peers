@@ -80,11 +80,11 @@ def refresh_peer_guard(peers):
         type filter hook output priority -8; policy accept;
         ct state established,related accept
         ip daddr @allowed_v4 tcp dport 22 accept
-        tcp dport 22 reject with icmpx type admin-prohibited
+        ct direction original tcp dport 22 reject with icmpx type admin-prohibited
     }}
     chain forward {{
         type filter hook forward priority -8; policy accept;
-        tcp dport 22 reject with icmpx type admin-prohibited
+        ct direction original tcp dport 22 reject with icmpx type admin-prohibited
     }}
 }}
 ''')
@@ -119,6 +119,35 @@ def refresh(mode='all'):
     print(f'APPLIED count={len(peers)}')
 
 
+def verify_runtime():
+    peers = normalize(PEERS.read_text())
+    def check_set(table, name):
+        data = run('nft', '-j', 'list', 'set', 'inet', table, name).stdout
+        sets = [item['set'] for item in __import__('json').loads(data)['nftables'] if 'set' in item]
+        if len(sets) != 1 or set(sets[0].get('elem', [])) != set(peers):
+            raise ValueError('managed SSH peer set differs from the saved list')
+    check_set(TABLE, 'allowed_v4')
+    for chain in ('output', 'forward'):
+        data = run('nft', '-j', 'list', 'chain', 'inet', TABLE, chain).stdout
+        rules = [item['rule'] for item in __import__('json').loads(data)['nftables'] if 'rule' in item]
+        expected_count = 3 if chain == 'output' else 1
+        if len(rules) != expected_count:
+            raise ValueError('managed SSH peer rules are incomplete')
+        def is_original_reject(rule):
+            expr = rule.get('expr', [])
+            return (any('reject' in item for item in expr) and
+                    any(item.get('match', {}).get('left') == {'ct': {'key': 'direction'}} and
+                        item.get('match', {}).get('right') == 'original' for item in expr))
+        if not any(is_original_reject(rule) for rule in rules):
+            raise ValueError('managed SSH peer request filter is missing')
+    for table in LEGACY:
+        if not table_exists(table):
+            continue
+        check_set(table, 'ssh_peer_v4')
+        if RULE_MARK not in run('nft', 'list', 'chain', 'inet', table, 'output').stdout:
+            raise ValueError('managed SSH peer exception is missing')
+
+
 def install_hooks():
     service = Path('/etc/systemd/system/remnanode-ssh-peers.service')
     service.write_text(f'''[Unit]
@@ -150,6 +179,8 @@ def main():
     action = sys.argv[1] if len(sys.argv) == 2 else ''
     if action == 'install-hooks':
         install_hooks()
+    elif action == 'verify':
+        verify_runtime()
     elif action == 'refresh':
         refresh()
     elif action == 'refresh-legacy':
@@ -168,7 +199,7 @@ def main():
             refresh()
             raise
     else:
-        raise ValueError('usage: remnanode-ssh-peers install-hooks|refresh|refresh-legacy|apply')
+        raise ValueError('usage: remnanode-ssh-peers install-hooks|refresh|refresh-legacy|apply|verify')
 
 
 if __name__ == '__main__':
