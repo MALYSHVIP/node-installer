@@ -13,6 +13,16 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nftables iptables iproute2 php-cli openssl util-linux psmisc
+          sudo apt-get install -y nftables iptables iproute2 php-cli openssl util-linux psmisc python3-yaml
       - name: Validate installer, prompts, PKI and isolated firewall traffic
         run: sudo bash tests/run_checks.sh
+      - name: Ubuntu 26.04 sudo-rs interactive input
+        run: |
+          docker run --rm --cpus=1 --memory=1g --pids-limit=256 \
+            -v "$PWD:/src:ro" -w /src ubuntu:26.04 bash -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get -o Dpkg::Use-Pty=0 update &&
+              apt-get -o Dpkg::Use-Pty=0 install -y --no-install-recommends python3 sudo-rs php-cli openssl python3-yaml &&
+              sudo --version | grep sudo-rs &&
+              python3 -m unittest discover -s tests -p "test_*.py" -v
+            '

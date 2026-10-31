@@ -63,6 +63,36 @@ grep -qx 'net.core.wmem_max = 134217728' "$SYSCTL_FILE"
 grep -qx 'net.core.netdev_max_backlog = 65536' "$SYSCTL_FILE"
 """)
 
+    def test_apt_noninteractive_input_and_config_policy(self):
+        self.shell("""
+prepare_package_network() { :; }
+apt_log_path_for_attempt() { printf '%s/apt.log' "$T"; }
+apt-get() {
+ [[ ! -t 0 ]] || exit 85
+ if read -r value; then exit 86; fi
+ printf '%s\n' "$@" >"$T/apt-args"
+}
+apt_retry install -y package
+for value in Dpkg::Use-Pty=0 Dpkg::Options::=--force-confdef Dpkg::Options::=--force-confold; do
+ grep -Fqx "$value" "$T/apt-args"
+done
+""")
+
+    def test_package_phase_inherits_ignored_terminal_stop_signals(self):
+        self.shell("""
+collect_inputs() { :; }
+validate_panel_ips_strict() { :; }
+validate_secret_payload() { :; }
+preflight_host() { :; }
+print_plan() { :; }
+create_backup() {
+ python3 -c 'import signal; assert signal.getsignal(signal.SIGTTIN)==signal.SIG_IGN; assert signal.getsignal(signal.SIGTTOU)==signal.SIG_IGN'
+ exit 0
+}
+YES=1
+run_install
+""")
+
     def test_syntax(self):
         subprocess.run([BASH, "-n", str(SCRIPT)], check=True)
 
@@ -277,7 +307,7 @@ grep -q 'normal line' "$T/log"
         return """
 require_trusted_root_file() { :; }
 sha256sum() {
-  if [[ "$1" == --check ]]; then command shasum -a 256 -c "$3"; else command shasum -a 256 "$@"; fi
+  if [[ -x /usr/bin/sha256sum ]]; then /usr/bin/sha256sum "$@"; elif [[ "$1" == --check ]]; then command shasum -a 256 -c "$3"; else command shasum -a 256 "$@"; fi
 }
 """
 
@@ -386,7 +416,7 @@ p=pathlib.Path(sys.argv[1])
 d={k:(p/f).read_text() for k,f in dict(caCertPem="ca.pem",jwtPublicKey="jwt.pem",nodeCertPem="node.pem",nodeKeyPem="node.key").items()}
 print(base64.b64encode(json.dumps(d).encode()).decode())
 ' "$T")"
-sha256sum() { command shasum -a 256; }
+sha256sum() { if [[ -x /usr/bin/sha256sum ]]; then /usr/bin/sha256sum; else command shasum -a 256; fi; }
 validate_secret_basic
 validate_secret_payload
 [[ -z "$SECRET_CHECK_DIR" ]]

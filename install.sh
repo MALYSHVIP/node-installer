@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
-BOOTSTRAP_VERSION="1.2.7"
+BOOTSTRAP_VERSION="1.2.8"
 # Capture at top level: inside a stdin-defined function Bash reports "main".
 BOOTSTRAP_SOURCE_PATH="${BASH_SOURCE[0]:-}"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
@@ -10,7 +10,7 @@ INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_REQUESTED_REF="$INSTALLER_REF"
 export INSTALLER_REPO INSTALLER_REF
 INSTALLER_FILE="${INSTALLER_FILE:-setup-remnanode.sh}"
-MIN_MAIN_INSTALLER_VERSION="4.1.8"
+MIN_MAIN_INSTALLER_VERSION="4.1.9"
 DOWNLOAD_ATTEMPTS=3
 TMP_FILE=""
 LOCAL_INSTALLER_USED=0
@@ -64,10 +64,10 @@ run_installer_script() {
     export NODE_INSTALLER_BOOTSTRAP_TMP_FILE="$TMP_FILE"
   fi
 
-  # Preserve an already-working stdin. In particular, sudo with use_pty gives
-  # the bootstrap a relay PTY as fd 0. Reopening /dev/tty inside that process
-  # bypasses sudo's input relay on affected hosts: prompts are visible, but the
-  # operator's replies never reach the installer.
+  # Keep sudo's own relay terminal when it is already stdin. For a pipeline,
+  # open this process's controlling terminal; never read an ancestor's PTY.
+  # The main shell uses its Readline builtin so sudo-rs observes foreground
+  # handover directly, before any package hook or tee child starts.
   if [[ -t 0 ]]; then
     exec "$bash_bin" "$installer" "$@"
   elif { exec 7</dev/tty; } 2>/dev/null; then
@@ -222,15 +222,6 @@ main() {
   local bash_bin=""
   need_root
   trap cleanup EXIT
-  # `curl ... | sudo bash` gives sudo a pipe as stdin. On hosts where sudo
-  # uses an intermediate PTY, output is relayed but replies typed by the user
-  # are not forwarded to the child PTY. Preserve that fact across the exec so
-  # the installer fails with a useful command instead of appearing to hang.
-  if [[ ! -t 0 ]]; then
-    export NODE_INSTALLER_PIPE_INPUT=1
-  else
-    unset NODE_INSTALLER_PIPE_INPUT
-  fi
   log "bootstrap version=${BOOTSTRAP_VERSION}"
 
   run_local_installer "$@" || local_rc=$?

@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.1.8"
+INSTALLER_VERSION="4.1.9"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -380,56 +380,12 @@ prepare_package_network() {
   return 1
 }
 
+# The sudo relay owns the user terminal. Reading an ancestor PTY competes
+# with it and sees raw CR bytes. Always read our own terminal with Readline.
 open_prompt_input() {
-  local self_tty=""
-  local process_id=""
-  local parent_id=""
-  local candidate=""
-  local descriptor=""
-
-  if [[ -n "$PROMPT_INPUT_FD" && -e "/proc/$$/fd/$PROMPT_INPUT_FD" && -t "$PROMPT_INPUT_FD" ]]; then
+  if [[ -n "$PROMPT_INPUT_FD" && -t "$PROMPT_INPUT_FD" ]]; then
     return 0
   fi
-  PROMPT_INPUT_FD=""
-
-  # With an ordinary invocation stdin already is the user's terminal.
-  if [[ "${NODE_INSTALLER_PIPE_INPUT:-0}" != "1" && -t 0 ]]; then
-    PROMPT_INPUT_FD=0
-    return 0
-  fi
-
-  # `curl | sudo bash` gives sudo a pipe on fd 0. With sudo use_pty, /dev/tty
-  # inside the command is sudo's private relay PTY, while the real SSH terminal
-  # remains attached to an ancestor. Walk only our own ancestor chain and open
-  # the first explicit terminal different from the private relay.
-  self_tty="$(readlink "/proc/$$/fd/0" 2>/dev/null || true)"
-  [[ "$self_tty" == /dev/pts/* || "$self_tty" == /dev/tty* ]] || \
-    self_tty="$(readlink "/proc/$$/fd/1" 2>/dev/null || true)"
-  process_id="$PPID"
-
-  while [[ "$process_id" =~ ^[0-9]+$ ]] && (( process_id > 1 )) && [[ -r "/proc/$process_id/status" ]]; do
-    for descriptor in 0 1 2; do
-      candidate="$(readlink "/proc/$process_id/fd/$descriptor" 2>/dev/null || true)"
-      case "$candidate" in
-        /dev/pts/[0-9]*|/dev/tty[0-9]*) ;;
-        *) continue ;;
-      esac
-      [[ "$candidate" != "$self_tty" && -c "$candidate" ]] || continue
-      if exec {PROMPT_INPUT_FD}<"$candidate"; then
-        if [[ -t "$PROMPT_INPUT_FD" ]]; then
-          return 0
-        fi
-        exec {PROMPT_INPUT_FD}<&-
-        PROMPT_INPUT_FD=""
-      fi
-    done
-    parent_id="$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$process_id/status" 2>/dev/null || true)"
-    [[ "$parent_id" != "$process_id" ]] || break
-    process_id="$parent_id"
-  done
-
-  # Direct `curl | bash` without sudo has no second PTY: the bootstrap already
-  # reconnected fd 0 to the correct controlling terminal.
   if [[ -t 0 ]]; then
     PROMPT_INPUT_FD=0
     return 0
@@ -451,10 +407,10 @@ ask() {
 
   open_prompt_input || \
     die "Не удалось открыть SSH-терминал для ввода. Передайте параметры через PANEL_IP/PANEL_IPS, XHTTP_DOMAIN и SECRET_FILE."
-  # Keep prompts on stderr: sudo relays it even though stdin carries the curl
-  # pipeline. Read replies directly from the resolved user terminal.
+  # Readline handles a single CR (Enter), editing and paste through the
+  # controlling terminal. The builtin runs in sudo's directly monitored child.
   printf '\n[INPUT] %s\n' "$prompt" >&2
-  IFS= read -r -t "$PROMPT_TIMEOUT" -u "$PROMPT_INPUT_FD" value || rc=$?
+  IFS= read -e -r -t "$PROMPT_TIMEOUT" -u "$PROMPT_INPUT_FD" value || rc=$?
 
   (( rc == 0 )) || die "Ввод не получен или прерван на запросе: $prompt (таймаут ${PROMPT_TIMEOUT}s)."
   PROMPT_VALUE="$value"
@@ -1736,7 +1692,8 @@ apt_retry() {
     APT_LAST_LOG="$log_path"
     if apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_TIMEOUT" -o APT::Update::Error-Mode=any \
       -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
-      "$@" 2>&1 | tee "$log_path"; then
+      -o Dpkg::Use-Pty=0 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+      "$@" </dev/null 2>&1 | tee "$log_path"; then
       return 0
     else
       # Capture the failed pipeline here. `$?` AFTER `fi` is zero without an
@@ -1773,6 +1730,7 @@ install_base_packages() {
 ensure_docker() {
   local installer=""
   local attempt=1 rc=0 apt_config="" docker_log=""
+  log "Проверяю Docker Engine и Compose после установки пакетов."
 
   if command -v docker >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
     die "Docker уже установлен без Compose plugin. Установите совместимый Docker Compose v2/v5 и повторите: существующий Engine автоматически не заменяю."
@@ -1791,12 +1749,12 @@ ensure_docker() {
     https://get.docker.com -o "$installer"
   sh -n "$installer" || die "Получен некорректный Docker installer."
   apt_config="$(mktemp /tmp/remnanode-docker-apt.XXXXXX)"
-  printf 'Acquire::Retries "2";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nDPkg::Lock::Timeout "%s";\nAPT::Update::Error-Mode "any";\n' \
+  printf 'Acquire::Retries "2";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nDPkg::Lock::Timeout "%s";\nAPT::Update::Error-Mode "any";\nDpkg::Use-Pty "0";\nDpkg::Options { "--force-confdef"; "--force-confold"; };\n' \
     "$APT_LOCK_TIMEOUT" >"$apt_config"
   while (( attempt <= 3 )); do
     docker_log="$(apt_log_path_for_attempt "docker-${attempt}")"
     APT_LAST_LOG="$docker_log"
-    if APT_CONFIG="$apt_config" sh "$installer" 2>&1 | tee "$docker_log"; then
+    if APT_CONFIG="$apt_config" sh "$installer" </dev/null 2>&1 | tee "$docker_log"; then
       rc=0
       break
     else
@@ -6643,6 +6601,9 @@ run_install() {
     }
   fi
 
+  # No later phase asks the operator for input. Background-terminal stop
+  # signals must not suspend package hooks or tee below sudo-rs.
+  trap '' TTIN TTOU
   create_backup
   install_base_packages
   ensure_docker
