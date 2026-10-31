@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.1.9"
+INSTALLER_VERSION="4.1.10"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -5777,7 +5777,10 @@ prepare_hysteria_revocation_guard() {
     tar -xzf "$CORE_FIX_BUILD_DIR/source.tgz" --strip-components=1 -C "$CORE_FIX_BUILD_DIR/source"
     apply_core_revocation_overlay "$CORE_FIX_BUILD_DIR/source"
     docker pull "$CORE_FIX_BUILDER"
-    timeout --kill-after=20s 1800s docker run --rm \
+    # The DNS reflection guard intentionally blocks bridged FORWARD DNS.
+    # Give this capability-restricted build process the same resolver path
+    # as host processes; do not relax the running node's firewall.
+    timeout --kill-after=20s 1800s docker run --rm --network host \
       --cidfile "$CORE_FIX_BUILD_DIR/build.cid" --label io.tokervpn.installer-scope=core-revocation-build \
       --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 \
       --cpus "$build_cpu" --memory "${build_memory}m" --memory-swap "${build_memory_swap}m" \
