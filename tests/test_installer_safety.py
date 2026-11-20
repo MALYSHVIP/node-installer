@@ -96,6 +96,50 @@ run_install
     def test_syntax(self):
         subprocess.run([BASH, "-n", str(SCRIPT)], check=True)
 
+    def test_nginx_security_versions(self):
+        self.shell("""
+nginx_version_is_fixed ubuntu:noble 1.24.0-2ubuntu7.20
+nginx_version_is_fixed ubuntu:resolute 1.28.3-2ubuntu1.14
+nginx_version_is_fixed debian:bookworm 1.22.1-9+deb12u11
+nginx_version_is_fixed debian:trixie 1.26.3-3+deb13u11
+nginx_version_is_fixed ubuntu:noble 1.30.7-1~noble
+nginx_version_is_fixed ubuntu:noble 1.31.9-1~noble
+if nginx_version_is_fixed ubuntu:noble 1.24.0-2ubuntu7.19 ||
+   nginx_version_is_fixed debian:bookworm 1.22.1-9+deb12u9 ||
+   nginx_version_is_fixed ubuntu:noble 1.31.8-1~noble; then
+  exit 1
+fi
+""")
+
+    def test_port_guard_conflicts_with_public_port_range(self):
+        self.shell("""
+ENABLE_XHTTP=0; ENABLE_MASKED_BBR=0; PUBLIC_UDP_PORTS=47799-47801
+validate_settings
+""", ok=False)
+
+    def test_nginx_hardening_keeps_custom_site_and_is_repeatable(self):
+        self.shell("""
+NGINX_MAIN_CONF="$T/nginx.conf"
+NGINX_DEFAULT_SITE="$T/default"
+XHTTP_DOMAIN=node.example.com
+printf 'http {\\n  # server_tokens off;\\n  ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;\\n  ssl_prefer_server_ciphers on;\\n}\\n' >"$NGINX_MAIN_CONF"
+printf 'custom vhost\\n' >"$NGINX_DEFAULT_SITE"
+dpkg-query() { printf '/etc/nginx/sites-available/default 00000000000000000000000000000000\\n'; }
+md5sum() { printf '11111111111111111111111111111111\\n'; }
+harden_nginx_defaults
+[[ "$NGINX_CONFIG_CHANGED" == 1 ]]
+grep -qx '  ssl_protocols TLSv1.2 TLSv1.3;' "$NGINX_MAIN_CONF"
+grep -qx '  server_tokens off;' "$NGINX_MAIN_CONF"
+grep -qx 'custom vhost' "$NGINX_DEFAULT_SITE"
+md5sum() { printf '00000000000000000000000000000000\\n'; }
+harden_nginx_defaults
+grep -Fq 'https://node.example.com$request_uri' "$NGINX_DEFAULT_SITE"
+grep -Fq 'location ^~ /.well-known/acme-challenge/' "$NGINX_DEFAULT_SITE"
+NGINX_CONFIG_CHANGED=0
+harden_nginx_defaults
+[[ "$NGINX_CONFIG_CHANGED" == 0 ]]
+""")
+
     def test_help_without_root(self):
         output = subprocess.check_output([BASH, str(SCRIPT), "--help"], text=True)
         self.assertIn("Node 3.4.2", output)

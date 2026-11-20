@@ -21,7 +21,7 @@ def link(pid,name,v4,v6):
 def server():
  import selectors
  s=selectors.DefaultSelector()
- ports=[22,25,53,80,443,465,587,2222,2525,6881,6999,2710,6969,16881,51413,53442]
+ ports=[22,25,53,80,443,465,587,2222,2525,6881,6999,2710,6969,16881,47800,51413,53442]
  for fam,addr in [(socket.AF_INET,'0.0.0.0'),(socket.AF_INET6,'::')]:
   for typ in [socket.SOCK_STREAM,socket.SOCK_DGRAM]:
    addresses=[addr] if typ==socket.SOCK_STREAM else (['198.18.10.1','198.18.20.2','198.18.20.3','198.18.20.200','8.8.8.8','203.0.113.53'] if fam==socket.AF_INET else ['2001:db8:10::1','2001:db8:20::2','2001:db8:20::200'])
@@ -100,6 +100,27 @@ try:
  srv=ROOT/'server.py';srv.write_text('import socket\n'+B['server_source']+'\nserver()\n');sp=ns(s,['python3','-c','import subprocess;subprocess.Popen(["python3",'+repr(str(srv))+'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)'])
  threading.Thread(target=server,daemon=True).start();time.sleep(.2)
  result('baseline_v4',connect('198.18.20.2',443));result('baseline_v6',connect('2001:db8:20::2',443));result('baseline_spamhaus_v6_target',connect('2001:db8:20::200',443));result('baseline_dns_udp',connect('8.8.8.8',53,True))
+ guard = {'__name__': 'port_guard_test'}
+ exec(B['port_47800_source'], guard)
+ guard['EXPECTED'] = ROOT / 'port-guard-state.json'
+ guard['LOCK'] = ROOT / 'port-guard.lock'
+ guard['RESERVED'] = ROOT / 'reserved-ports'
+ guard['RESERVED'].write_text('35000-35004\n')
+ for address in ['198.18.20.2', '2001:db8:20::2']:
+  for udp in [False, True]:
+   result('baseline_47800_'+address+'_'+str(udp), connect(address,47800,udp))
+ with contextlib.redirect_stdout(io.StringIO()):
+  guard['main']()
+ run(['nft','delete','table','inet','tokervpn_port_47800'])
+ with contextlib.redirect_stdout(io.StringIO()):
+  guard['main']()
+ result('47800_reserved_preserving_existing',guard['RESERVED'].read_text().strip()=='35000-35004,47800')
+ for inbound,outbound in [('198.18.10.1','198.18.20.2'),('2001:db8:10::1','2001:db8:20::2')]:
+  for udp in [False, True]:
+   result('47800_input_'+inbound+'_'+str(udp),not client(c,inbound,47800,udp))
+   result('47800_output_'+outbound+'_'+str(udp),not connect(outbound,47800,udp))
+   result('47800_forward_'+outbound+'_'+str(udp),not client(c,outbound,47800,udp))
+   result('443_after_47800_guard_'+outbound+'_'+str(udp),client(c,outbound,443,udp))
  for name in ['write_firewall','write_outbound_ssh_guard','write_dns_reflection_guard','write_spamhaus_egress_guard','write_bittorrent_guard']:
   flush();pre,path=generate(name);activate(pre,path)
   result(name+'_syntax_and_apply',True)
