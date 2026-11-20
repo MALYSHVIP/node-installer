@@ -24,6 +24,7 @@ bundle = {'version': re.search(r'^INSTALLER_VERSION="([^"]+)"', source, re.M)[1]
           'functions': {a: source[source.index('\n'+a+'() {')+1:source.index('\n'+b+'() {')]
                         for a, b in functions.items()},
           'peers_source': (ROOT / 'bin/remnanode-ssh-peers').read_text(),
+          'port_47800_source': (ROOT / 'bin/tokervpn-port-47800-guard').read_text(),
           'server_source': definition('server'), 'connect_source': definition('connect')}
 if os.geteuid() != 0:
     raise SystemExit('Run this test as root; it creates its own disposable network namespace.')

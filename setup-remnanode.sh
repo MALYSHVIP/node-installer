@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Do not restart unrelated production services during dependency installation.
 export NEEDRESTART_MODE=l
 
-INSTALLER_VERSION="4.1.10"
+INSTALLER_VERSION="4.1.11"
 INSTALLER_REPO="${INSTALLER_REPO:-MALYSHVIP/node-installer}"
 INSTALLER_REF="${INSTALLER_REF:-main}"
 INSTALLER_MAIN_BASHPID="$BASHPID"
@@ -80,6 +80,16 @@ BITTORRENT_GUARD_SCRIPT="/usr/local/sbin/vpn-torrent-guard.sh"
 BITTORRENT_GUARD_SERVICE="/etc/systemd/system/vpn-torrent-guard.service"
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/60-remnanode-limits.conf"
 LEGACY_REBOOT_MARKER="$STATE_DIR/legacy-runtime-boot-id"
+SCTP_CONF="/etc/modprobe.d/90-nginx-security-sctp.conf"
+SSH_JAIL="/etc/fail2ban/jail.d/90-toker-sshd.local"
+PORT_GUARD="/usr/local/sbin/tokervpn-port-47800-guard"
+PORT_GUARD_SERVICE="/etc/systemd/system/tokervpn-port-47800-guard.service"
+PORT_GUARD_TIMER="/etc/systemd/system/tokervpn-port-47800-guard.timer"
+PORT_GUARD_STATE="/etc/tokervpn-port-47800/expected.json"
+RESERVED_PORTS="/proc/sys/net/ipv4/ip_local_reserved_ports"
+NGINX_MAIN_CONF="/etc/nginx/nginx.conf"
+NGINX_DEFAULT_SITE="/etc/nginx/sites-enabled/default"
+ROLLBACK_LEGACY_SECURITY=0
 
 NGINX_SITE_AVAILABLE="/etc/nginx/sites-available/remnanode-xhttp.conf"
 NGINX_SITES_ENABLED_SITE="/etc/nginx/sites-enabled/remnanode-xhttp.conf"
@@ -209,6 +219,7 @@ TLS_CHANGED=0
 BACKUP_HAS_SYSTEM_FILES=0
 TLS_MIN_VALID_SECONDS=604800
 NGINX_RESTART_REQUIRED=0
+NGINX_CONFIG_CHANGED=0
 NGINX_LOCK_FD=""
 APT_LAST_LOG=""
 PROFILE_VERIFIED=0
@@ -1168,6 +1179,10 @@ validate_settings() {
   if port_in_csv "$NODE_PORT" "$PUBLIC_TCP_PORTS"; then
     die "NODE_PORT $NODE_PORT нельзя включать в PUBLIC_TCP_PORTS: control API должен быть доступен только панели."
   fi
+  if { bool_true "$MANAGE_FIREWALL" || [[ -x "$PORT_GUARD" ]]; } && { [[ "$NODE_PORT" == 47800 ]] ||
+     port_in_csv 47800 "$PUBLIC_TCP_PORTS" || port_in_csv 47800 "$PUBLIC_UDP_PORTS"; }; then
+    die "TCP/UDP 47800 зарезервирован защитой. Выберите другой порт."
+  fi
 
   [[ "$APT_LOCK_TIMEOUT" =~ ^[0-9]{1,4}$ ]] || die "APT_LOCK_TIMEOUT должен быть числом (секунды)."
   if [[ -n "$NODE_IMAGE_INPUT" ]]; then
@@ -1656,6 +1671,7 @@ print_plan() {
   printf '  anti-abuse guards: spamhaus=%s ssh22=%s dns53=%s bittorrent=%s\n' \
     "$ENABLE_SPAMHAUS_EGRESS_GUARD" "$ENABLE_OUTBOUND_SSH_GUARD" \
     "$ENABLE_DNS_REFLECTION_GUARD" "$ENABLE_BITTORRENT_GUARD"
+  printf '  port 47800 guard: %s\n' "$MANAGE_FIREWALL"
   printf '  BBR baseline:     %s\n' "$ENABLE_BBR"
   printf '  offload/qdisc:    %s (host-wide, opt-in)\n' "$ENABLE_QUIC_TUNING"
   printf '  automatic swap:   %s\n' "$AUTO_SWAP"
@@ -1857,6 +1873,9 @@ containerd.service
 nginx.service
 certbot.timer
 EOF
+  if (( ROLLBACK_LEGACY_SECURITY == 0 )); then
+    printf '%s\n' fail2ban.service tokervpn-port-47800-guard.service tokervpn-port-47800-guard.timer
+  fi
 }
 
 backup_system_paths() {
@@ -1889,6 +1908,7 @@ backup_system_paths() {
     "$JOURNALD_DROPIN" "$LEGACY_REBOOT_MARKER" "$TLS_DIR" "$PANEL_IPS_FILE" \
     "$COVER_ROOT/index.html" "$COVER_ROOT/404.html" "$HYSTERIA_MASQUERADE_FILE" \
     "$MASKED_BBR_CONTRACT_FILE" "$MASKED_BBR_PASSWORD_FILE" \
+    "$SCTP_CONF" "$SSH_JAIL" "$PORT_GUARD" "$PORT_GUARD_SERVICE" "$PORT_GUARD_TIMER" "$PORT_GUARD_STATE" "$NGINX_DEFAULT_SITE" \
     /etc/nginx/conf.d/00-remnanode-hash-tuning.conf \
     /etc/fstab /etc/nginx/nginx.conf /etc/ufw/user.rules /etc/ufw/user6.rules; do
     [[ -e "$path" || -L "$path" ]] || continue
@@ -2045,6 +2065,12 @@ create_backup() {
 
   backup_system_paths
   backup_sysctl_runtime
+  # An empty file is a valid snapshot of an empty reserved-ports setting.
+  if [[ -r "$RESERVED_PORTS" ]]; then
+    cat "$RESERVED_PORTS" >"$BACKUP_DIR/reserved-ports-before"
+  else
+    : >"$BACKUP_DIR/reserved-ports-before"
+  fi
 
   {
     printf 'BACKUP_FORMAT=%q\n' "3"
@@ -2071,7 +2097,7 @@ create_backup() {
   [[ ! -f "$BACKUP_DIR/system-files.tgz" ]] || tar -tzf "$BACKUP_DIR/system-files.tgz" >/dev/null
   (
     cd "$BACKUP_DIR"
-    local -a files=(manifest.env sysctl-runtime.tsv)
+    local -a files=(manifest.env sysctl-runtime.tsv reserved-ports-before)
     local file=""
     for file in node-root.tgz system-files.tgz previous-image.tar.gz; do
       [[ ! -f "$file" ]] || files+=("$file")
@@ -2242,6 +2268,7 @@ rollback_from_backup() {
   # shellcheck disable=SC1090,SC1091
   source "$backup/manifest.env"
   backup_format="${BACKUP_FORMAT:-}"
+  [[ -f "$backup/reserved-ports-before" ]] || ROLLBACK_LEGACY_SECURITY=1
   had_node_root="${HAD_NODE_ROOT:-0}"
   had_container="${HAD_CONTAINER:-0}"
   was_running="${WAS_RUNNING:-0}"
@@ -2335,6 +2362,16 @@ rollback_from_backup() {
   systemctl stop remnanode-xhttp-socket-guard.service >/dev/null 2>&1 || true
   systemctl disable --now remnanode-quic-runtime.service >/dev/null 2>&1 || true
   systemctl disable --now remnanode-ssh-peers-pull.timer >/dev/null 2>&1 || true
+  if (( ROLLBACK_LEGACY_SECURITY == 0 )); then
+    systemctl disable --now tokervpn-port-47800-guard.timer tokervpn-port-47800-guard.service fail2ban.service >/dev/null 2>&1 || true
+    if command -v nft >/dev/null 2>&1 && nft list table inet tokervpn_port_47800 >/dev/null 2>&1; then
+      nft delete table inet tokervpn_port_47800 || rollback_failed=1
+    fi
+    rm -f -- "$SCTP_CONF" "$SSH_JAIL" "$PORT_GUARD" "$PORT_GUARD_SERVICE" "$PORT_GUARD_TIMER" "$PORT_GUARD_STATE" "$NGINX_DEFAULT_SITE"
+    if [[ -w "$RESERVED_PORTS" ]]; then
+      printf '%s\n' "$(<"$backup/reserved-ports-before")" >"$RESERVED_PORTS" || rollback_failed=1
+    fi
+  fi
   for unit in remnanode-spamhaus-egress-guard.timer remnanode-spamhaus-egress-guard.service \
     remnanode-outbound-ssh-guard.service remnanode-ssh-peers.service \
     remnanode-dns-reflection-guard.service vpn-torrent-guard.service; do
@@ -4112,6 +4149,8 @@ verify_antiabuse_guards() {
   local spec="" bin="" out_chain="" fwd_chain=""
   if bool_true "$MANAGE_FIREWALL"; then
     nft list table inet remnanode_installer >/dev/null 2>&1 || die "Control/SMTP firewall table is missing."
+    systemctl is-active --quiet tokervpn-port-47800-guard.timer || die "Таймер защиты порта 47800 не активен."
+    "$PORT_GUARD" --check || die "Защита TCP/UDP 47800 не прошла проверку."
   fi
   if bool_true "$ENABLE_SPAMHAUS_EGRESS_GUARD"; then
     systemctl is-active --quiet remnanode-spamhaus-egress-guard.timer || die "Spamhaus refresh timer is not active."
@@ -4167,6 +4206,95 @@ ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
 PYMODULE
   install -m 0700 -o root -g root "$source_file" "$target"
 )
+
+install_port_guard() {
+  bool_true "$MANAGE_FIREWALL" || return 0
+  install_verified_python_module tokervpn-port-47800-guard "$PORT_GUARD" \
+    '66bf2af131a1e33307ccc96000c3241617d84dd4a390c600b3bc581e53a6e936'
+  cat >"$PORT_GUARD_SERVICE" <<EOF
+[Unit]
+Description=Reserve and filter TCP/UDP port 47800
+After=nftables.service systemd-sysctl.service network-pre.target
+Before=docker.service
+[Service]
+Type=oneshot
+ExecStart=$PORT_GUARD
+TimeoutStartSec=25
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat >"$PORT_GUARD_TIMER" <<'EOF'
+[Unit]
+Description=Verify the TCP/UDP 47800 firewall policy
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+RandomizedDelaySec=5s
+Unit=tokervpn-port-47800-guard.service
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 0644 "$PORT_GUARD_SERVICE" "$PORT_GUARD_TIMER"
+  systemctl daemon-reload
+  systemctl enable --now tokervpn-port-47800-guard.service tokervpn-port-47800-guard.timer
+}
+
+configure_ssh_protection() {
+  command -v sshd >/dev/null 2>&1 || return 0
+  local ports="" trusted=""
+  ports="$(sshd -T | awk '$1 == "port" {printf "%s%s", sep, $2; sep=","}')"
+  [[ -n "$ports" ]] || die "Не удалось определить порты SSH для Fail2ban."
+  # Panel allowlist input has already passed strict IP/CIDR validation.
+  trusted="$(printf '%s\n' "$PANEL_IPS" | tr ',' ' ')"
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    local peer="" rest=""
+    read -r peer rest <<<"$SSH_CONNECTION"
+    # SSH_CONNECTION may be inherited through sudo. Accept only a literal
+    # address to avoid injecting Fail2ban directives into the config.
+    if [[ "$peer" =~ ^[0-9A-Fa-f:.]+$ ]]; then
+      trusted+=" $peer"
+    fi
+  fi
+  install -d -m 0755 "$(dirname "$SSH_JAIL")"
+  # Create the jail before apt, since package hooks may start Fail2ban.
+  # Retain a previously installed jail and its operator-defined exemptions.
+  if [[ ! -e "$SSH_JAIL" ]]; then
+    cat >"$SSH_JAIL" <<EOF
+[sshd]
+enabled = true
+backend = systemd
+port = $ports
+findtime = 600
+maxretry = 5
+bantime = 3600
+ignoreip = 127.0.0.1/8 ::1 46.29.160.153 $trusted
+banaction = iptables-multiport
+EOF
+    chmod 0644 "$SSH_JAIL"
+  fi
+  apt_retry install -y --no-install-recommends fail2ban python3-systemd
+  fail2ban-client -t
+  systemctl enable --now fail2ban.service
+  fail2ban-client reload
+}
+
+verify_ssh_protection() {
+  command -v sshd >/dev/null 2>&1 || return 0
+  fail2ban-client status sshd >/dev/null || die "Fail2ban не запустил защиту SSH."
+}
+
+disable_unused_sctp() {
+  if [[ -d /sys/module/sctp ]]; then
+    warn "SCTP уже загружен. Проверьте его использование перед отключением."
+    return 0
+  fi
+  if [[ ! -e "$SCTP_CONF" ]]; then
+    printf '%s\n' '# Managed by RemnaNode installer.' 'install sctp /bin/false' 'blacklist sctp' >"$SCTP_CONF"
+    chmod 0644 "$SCTP_CONF"
+  fi
+  [[ "$(modprobe -n -v sctp)" == *'/bin/false'* ]] || die "Не подтверждён запрет автозагрузки SCTP."
+}
 
 install_ssh_peers_pull_module() {
   install_verified_python_module remnanode-ssh-peers "$SSH_PEERS_SCRIPT" '4639df3bd01ac6ef292e94ba69ed1a09689fcf1a0216c2b2535112840c7994db'
@@ -4262,6 +4390,123 @@ EOF
   rm -f "$tmp_dropin"
   chmod 0644 "$NGINX_CAPACITY_DROPIN"
   systemctl daemon-reload
+}
+
+nginx_version_is_fixed() {
+  local release="$1" installed="$2" minimum=""
+  # Minimum fixed revisions for CVE-2026-123007, from distro advisories.
+  # A base nginx version alone does not identify the distro backport.
+  case "$release:$installed" in
+    ubuntu:jammy:*ubuntu*) minimum=1.18.0-6ubuntu14.23 ;;
+    ubuntu:noble:*ubuntu*) minimum=1.24.0-2ubuntu7.20 ;;
+    ubuntu:resolute:*ubuntu*) minimum=1.28.3-2ubuntu1.13 ;;
+    ubuntu:stonking:*ubuntu*) minimum=1.30.4-7ubuntu1.2 ;;
+    ubuntu:focal:*ubuntu*) minimum=1.18.0-0ubuntu1.7+esm5 ;;
+    ubuntu:bionic:*ubuntu*) minimum=1.14.0-0ubuntu1.11+esm6 ;;
+    debian:bookworm:*+deb12*) minimum=1.22.1-9+deb12u11 ;;
+    debian:trixie:*+deb13*) minimum=1.26.3-3+deb13u11 ;;
+    debian:sid:1.30.6-[0-9]*|debian:forky:1.30.6-[0-9]*) minimum=1.30.6-4 ;;
+    *)
+      # Upstream mainline 1.31.0..1.31.8 sorts after stable 1.30.7.
+      if dpkg --compare-versions "$installed" ge 1.31.0; then
+        minimum=1.31.9
+      else
+        minimum=1.30.7
+      fi
+      ;;
+  esac
+  dpkg --compare-versions "$installed" ge "$minimum"
+}
+
+ensure_fixed_nginx_package() {
+  local installed="" master=""
+  local ID="" VERSION_CODENAME=""
+  source /etc/os-release
+  installed="$(dpkg-query -W -f='${Version}' nginx)"
+  nginx_version_is_fixed "$ID:$VERSION_CODENAME" "$installed" || \
+    die "nginx $installed не подтверждён как исправленный для CVE-2026-123007. Проверьте доступность обновлений безопасности APT."
+  [[ "$(command -v nginx)" == /usr/sbin/nginx ]] || die "В PATH найден nginx вне системного пакета."
+  master="$(systemctl show nginx.service --property=MainPID --value)"
+  if [[ "$master" =~ ^[1-9][0-9]*$ ]] && ! cmp -s /usr/sbin/nginx "/proc/$master/exe"; then
+    NGINX_RESTART_REQUIRED=1
+  fi
+  log "nginx $installed содержит исправление CVE-2026-123007."
+}
+
+verify_running_nginx() {
+  local pid="" worker=""
+  pid="$(systemctl show nginx.service --property=MainPID --value)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] && cmp -s /usr/sbin/nginx "/proc/$pid/exe" ||
+    die "Запущенный nginx не совпадает с системным пакетом."
+  local -a workers=()
+  read -r -a workers <"/proc/$pid/task/$pid/children" || true
+  for worker in "${workers[@]}"; do
+    if ! cmp -s /usr/sbin/nginx "/proc/$worker/exe" && [[ -e "/proc/$worker/exe" ]]; then
+      die "Найден процесс nginx со старым бинарным файлом."
+    fi
+  done
+}
+
+harden_nginx_defaults() {
+  local changed="" packaged_hash="" actual_hash="" site="" ipv6_http=""
+  # Recognize only the shipped global defaults. Keep custom values and site
+  # config intact, including additional nginx virtual hosts on updates.
+  changed="$(python3 - "$NGINX_MAIN_CONF" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+before = path.read_text()
+after = re.sub(r'(?m)^([ \t]*)ssl_protocols\s+TLSv1 TLSv1\.1 TLSv1\.2 TLSv1\.3;',
+               r'\1ssl_protocols TLSv1.2 TLSv1.3;', before, count=1)
+after = re.sub(r'(?m)^([ \t]*)ssl_prefer_server_ciphers\s+on;',
+               r'\1ssl_prefer_server_ciphers off;', after, count=1)
+if not re.search(r'(?m)^[ \t]*server_tokens\s+', after):
+    after = re.sub(r'(?m)^([ \t]*)#[ \t]*server_tokens off;',
+                   r'\1server_tokens off;', after, count=1)
+if after != before:
+    path.write_text(after)
+    print('changed')
+PY
+)"
+  [[ "$changed" != changed ]] || NGINX_CONFIG_CHANGED=1
+  [[ -f "$NGINX_DEFAULT_SITE" ]] || return 0
+  if ! grep -Fxq '# Managed by RemnaNode installer (default HTTP site).' "$NGINX_DEFAULT_SITE"; then
+    packaged_hash="$(dpkg-query -W -f='${Conffiles}\n' nginx-common |
+      awk '$1 == "/etc/nginx/sites-available/default" {print $2}')"
+    actual_hash="$(md5sum "$NGINX_DEFAULT_SITE" | awk '{print $1}')"
+    [[ -n "$packaged_hash" && "$packaged_hash" == "$actual_hash" ]] || return 0
+  fi
+  if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] &&
+     [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" == 0 ]]; then
+    ipv6_http="    listen [::]:80 default_server;"
+  fi
+  site="$(mktemp)"
+  cat >"$site" <<EOF
+# Managed by RemnaNode installer (default HTTP site).
+server {
+    listen 80 default_server;
+$ipv6_http
+    server_name _;
+    server_tokens off;
+    location ^~ /.well-known/acme-challenge/ {
+        root $NGINX_ACME_ROOT;
+        default_type text/plain;
+        auth_basic off;
+        allow all;
+        try_files \$uri =404;
+    }
+    location / {
+        return 301 https://$XHTTP_DOMAIN\$request_uri;
+    }
+}
+EOF
+  if ! cmp -s "$site" "$NGINX_DEFAULT_SITE"; then
+    install -m 0644 "$site" "$NGINX_DEFAULT_SITE"
+    NGINX_CONFIG_CHANGED=1
+  fi
+  rm -f "$site"
 }
 
 ensure_nginx_hash_tuning() {
@@ -5138,7 +5383,7 @@ write_nginx_xhttp_site() {
     systemctl start nginx
   elif (( NGINX_RESTART_REQUIRED == 1 )); then
     systemctl restart nginx
-  elif (( changed == 1 || had_bootstrap == 1 || TLS_CHANGED == 1 )); then
+  elif (( changed == 1 || had_bootstrap == 1 || TLS_CHANGED == 1 || NGINX_CONFIG_CHANGED == 1 )); then
     systemctl reload nginx
   fi
   verify_local_cover
@@ -5170,7 +5415,7 @@ write_nginx_masked_bbr_site() {
     systemctl start nginx
   elif (( NGINX_RESTART_REQUIRED == 1 )); then
     systemctl restart nginx
-  elif (( changed == 1 || had_bootstrap == 1 || TLS_CHANGED == 1 )); then
+  elif (( changed == 1 || had_bootstrap == 1 || TLS_CHANGED == 1 || NGINX_CONFIG_CHANGED == 1 )); then
     systemctl reload nginx
   fi
   verify_local_cover
@@ -5226,8 +5471,10 @@ configure_xhttp_module() {
   ensure_nginx_hash_tuning
   apt_retry install -y --no-install-recommends nginx certbot
   acquire_nginx_lock
+  ensure_fixed_nginx_package
   select_nginx_include_target
   tune_nginx_capacity
+  harden_nginx_defaults
   install -d -m 0755 "$NGINX_ACME_ROOT" "$NGINX_ACME_ROOT/.well-known" \
     "$NGINX_ACME_ROOT/.well-known/acme-challenge"
   ensure_nginx_public_access
@@ -5258,6 +5505,7 @@ configure_xhttp_module() {
   else
     write_nginx_masked_bbr_site
   fi
+  verify_running_nginx
   verify_acme_http_path
   release_nginx_lock
 }
@@ -6475,6 +6723,8 @@ show_status() {
   local outbound_ssh_guard="inactive"
   local dns_reflection_guard="inactive"
   local bittorrent_guard="inactive"
+  local port_guard_status="inactive"
+  local ssh_jail_status="inactive"
   local bbr=""
   bbr="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '-')"
 
@@ -6515,6 +6765,12 @@ PY
   nft list table inet remnanode_outbound_ssh_guard >/dev/null 2>&1 && outbound_ssh_guard="active"
   nft list table inet remnanode_dns_reflection_guard >/dev/null 2>&1 && dns_reflection_guard="active"
   nft list table inet vpn_torrent_guard >/dev/null 2>&1 && bittorrent_guard="active"
+  if [[ -x "$PORT_GUARD" ]] && "$PORT_GUARD" --check >/dev/null 2>&1; then
+    port_guard_status="active"
+  fi
+  if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client status sshd >/dev/null 2>&1; then
+    ssh_jail_status="active"
+  fi
 
   printf 'Installer:       %s\n' "$INSTALLER_VERSION"
   printf 'Container:       %s\n' "$state"
@@ -6531,6 +6787,8 @@ PY
   printf 'SSH egress:      %s\n' "$outbound_ssh_guard"
   printf 'DNS egress:      %s\n' "$dns_reflection_guard"
   printf 'BitTorrent:      %s\n' "$bittorrent_guard"
+  printf 'Port 47800:      %s\n' "$port_guard_status"
+  printf 'SSH Fail2ban:    %s\n' "$ssh_jail_status"
   printf 'Maintenance:     %s\n' "$maintenance"
   printf 'QUIC runtime:    %s\n' "$quic_runtime"
   printf 'xHTTP recovery:  %s\n' "$xhttp_guard"
@@ -6609,6 +6867,9 @@ run_install() {
   trap '' TTIN TTOU
   create_backup
   install_base_packages
+  configure_ssh_protection
+  disable_unused_sctp
+  install_port_guard
   ensure_docker
   # The verified Hysteria patch is compiled before node files are rendered.
   # Low-memory VPSes therefore need their requested swap before this step.
@@ -6639,6 +6900,7 @@ run_install() {
   start_xhttp_socket_guard
   verify_node
   verify_antiabuse_guards
+  verify_ssh_protection
   cleanup_legacy_bittorrent_runtime
   refresh_dns_reflection_guard_runtime
   write_state
@@ -6651,6 +6913,9 @@ run_install() {
   print_profile_contract
   if legacy_reboot_required; then
     warn "Старые MTU/RPS/offload/qdisc/DNS/SSH runtime-настройки могли остаться в памяти ядра. Выполните один плановый reboot после проверки доступности ноды."
+  fi
+  if [[ -e /run/reboot-required ]]; then
+    warn "Установленные обновления ОС требуют плановой перезагрузки. Текущее ядро: $(uname -r)."
   fi
   printf '\nBackup для ручного rollback: %s\n' "$BACKUP_DIR"
   printf 'Rollback: sudo bash setup-remnanode.sh rollback --backup %q\n' "$BACKUP_DIR"
